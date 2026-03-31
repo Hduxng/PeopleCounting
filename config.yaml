@@ -1,0 +1,94 @@
+video:
+  source: 0           # 0 = webcam, or path to video file e.g. "test.mp4"
+  fps_override: null  # null = use video fps; set a number to override
+
+# Global compute settings — applied to detector, tracker, and Re-ID
+compute:
+  device: "cuda:0" # auto | cuda | cpu | cuda:0 | cuda:1
+  half: true       # FP16 inference — faster on GPU, not supported on CPU
+
+detector:
+  model: "yolov8n.pt"       # yolov8n/s/m/l/x.pt — larger = more accurate, slower
+  confidence: 0.35          # two-stage: low threshold lets tracker associate partial detections
+  confidence_new_track: 0.5 # only CREATE a new track if confidence >= this value
+  iou: 0.4
+  classes: [0]              # COCO class 0 = person
+
+tracker:
+  # Tracker options (best → fastest):
+  #   strongsort  — EMA features + NSA Kalman + MSMT17 Re-ID  [recommended]
+  #   deepsort    — custom OSNet Re-ID + TTA embeddings
+  #   bytetrack   — ultralytics built-in, fastest, no appearance
+  #   botsort     — ultralytics built-in, fast + Re-ID
+  type: "strongsort"
+
+  # Shared params
+  n_init: 3             # frames to confirm a new track
+  max_iou_distance: 0.7
+  max_cosine_distance: 0.3
+  nn_budget: 100
+
+  # StrongSORT-specific
+  max_age: 60           # frames to keep lost track alive (~2s at 30fps)
+  ema_alpha: 0.9        # EMA weight for appearance features
+  min_conf: 0.35        # keep in sync with detector.confidence
+
+  # Re-ID model — osnet_ain handles lighting/camera changes better than plain osnet
+  reid:
+    weights: "osnet_ain_x1_0_msmt17.pt"  # AIN: Adaptive Instance Norm, better cross-domain
+    tta: false
+
+  # Feature gallery for Re-ID recovery (prevents double-counting after occlusion)
+  gallery:
+    enabled: true
+    lifetime: 90          # frames to keep a lost track in gallery (~3s at 30fps)
+    ema_alpha: 0.85       # feature EMA for gallery updates
+    match_threshold: 0.28 # cosine distance threshold for re-ID match (lower = stricter)
+
+  # TrackAnchor — guarantees track survival for people still visible in frame
+  anchor:
+    enabled: true
+    min_iou: 0.15         # IoU threshold to consider a track "covered" by a detection
+    synthetic_conf: 0.45  # confidence of injected detections (must be > min_conf, < confidence_new_track)
+    min_hits: 3           # minimum confirmed frames before a track is eligible for anchoring
+    max_inject: 10        # max synthetic detections per frame
+
+counting:
+  mode: "zone"   # line | zone | both
+
+  crosslines:
+    - id: "line_entrance"
+      name: "Entrance"
+      # Two endpoints of the line: [[x1, y1], [x2, y2]]
+      points: [[89, 355], [1205, 355]]
+      # Which side is "enter":
+      #   "positive" = crossing from negative to positive side of the line (cross-product convention)
+      #   "negative" = the opposite
+      enter_direction: "positive"
+      # Hysteresis buffer in pixels around the line.
+      # Person must move this far from the line before a crossing is confirmed.
+      # Prevents counting oscillations (slide 4 rule).
+      buffer_px: 20
+
+  zones:
+    - id: "zone_waiting"
+      name: "Waiting Area"
+      # Polygon vertices [[x1,y1], [x2,y2], ...] — at least 3 points
+      points: [[141, 135], [614, 120], [596, 295], [141, 296]]
+      # Minimum seconds a person must stay inside to be counted (slide 5 rule)
+      min_dwell_seconds: 10.0
+
+display:
+  window_name: "People Counting"
+  window_size: [1600, 900]  # initial OpenCV preview size; still resizable
+  show_bbox: true
+  show_centers: true
+  show_ids: true
+  # Colors in BGR (OpenCV format)
+  bbox_color: [0, 255, 255]     # cyan
+  line_color: [0, 255, 0]       # green
+  zone_color: [0, 165, 255]     # orange
+  count_text_color: [255, 255, 255]
+  font_scale: 0.6
+  thickness: 2
+  bbox_ema_alpha: 0.6   # bbox smoothing: 1.0=no smoothing, 0.4=heavy smoothing
