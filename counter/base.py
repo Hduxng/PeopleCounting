@@ -28,5 +28,14 @@ class BaseCounter(ABC):
     def remove_track(self, track_id: int) -> None:
         """Called when a tracked object permanently disappears."""
 
+    def mark_lost(
+        self,
+        track_id: int,
+        center: Tuple[float, float] | None,
+        timestamp: float,
+    ) -> None:
+        """Called immediately when an active track disappears before final cleanup."""
+        pass
+
     def get_counts(self) -> dict:
         return {"in": self.count_in, "out": self.count_out}
