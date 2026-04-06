@@ -234,6 +234,24 @@ class TestLevel2_ZoneEdgeCases:
 
         assert counter.get_counts()["in"] == 0
 
+    def test_counted_zone_track_brief_boundary_exit_does_not_recount(self, fast_zone_cfg):
+        counter = ZoneCounter(fast_zone_cfg)
+        tid = 1
+        fps = 30.0
+
+        for f in range(20):
+            counter.update(tid, (600, 350), timestamp=f / fps)
+        assert counter.get_counts()["in"] == 1
+
+        # Brief boundary jitter / merge wobble: outside for ~0.33s (< 0.4s grace)
+        for f in range(20, 30):
+            counter.update(tid, (600, 510), timestamp=f / fps)
+
+        for f in range(30, 60):
+            counter.update(tid, (600, 350), timestamp=f / fps)
+
+        assert counter.get_counts()["in"] == 1
+
     def test_multiple_people_in_zone(self, fast_zone_cfg):
         """3 people in zone simultaneously, each dwelling enough → count=3."""
         counter = ZoneCounter(fast_zone_cfg)
@@ -348,7 +366,9 @@ class TestLevel2_StateTransfer:
 
 
     def test_zone_transfer_merges_exited_state_and_preserves_refractory(self, fast_zone_cfg):
-        counter = ZoneCounter(fast_zone_cfg)
+        cfg = dict(fast_zone_cfg)
+        cfg["exit_grace_seconds"] = 0.0
+        counter = ZoneCounter(cfg)
 
         for f in range(20):
             counter.update(55, (600, 350), timestamp=f / 30.0)

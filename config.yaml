@@ -117,8 +117,13 @@ tracker:
     lifetime: 300
     ema_alpha: 0.85
     match_threshold: 0.35
+    max_prototypes: 5
+    min_update_conf: 0.55
+    min_crop_area: 800
     drift_threshold: 0.6
     merge_area_ratio: 1.5   # bbox area jump ≥ 1.5x → freeze feature (merge detected)
+    merge_release_ratio: 1.35  # unfreeze once area settles back below this multiple of pre-merge size
+    merge_hold_frames: 45      # fail-safe: never keep merge freeze longer than this many frames
 
   # --- TrackAnchor — velocity-EMA prediction with adaptive drift ---
   anchor:
@@ -166,6 +171,7 @@ counting:
       points: [[96, 101], [628, 103], [619, 258], [89, 256]]
       min_dwell_seconds: 10.0
       refractory_seconds: 0.17
+      exit_grace_seconds: 0.4
 
 display:
   window_name: "People Counting"

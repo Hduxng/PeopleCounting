@@ -12,6 +12,8 @@ Usage:
     dbg.log_remap(frame_idx, new_tid, old_tid)
     dbg.log_merge(frame_idx, tid, area, prev_area)
     dbg.log_counter_event(frame_idx, tid, counter_name, event)
+    dbg.log_gallery_skip(frame_idx, tid, reason="low_conf", confidence=0.42)
+    dbg.log_gallery_prototypes(frame_idx, tid, count=4)
     dbg.log_lost(frame_idx, tid)
     dbg.close()
 
@@ -25,6 +27,7 @@ import csv
 import io
 import os
 import time
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 
@@ -61,6 +64,9 @@ class DebugLogger:
         # --- events.log ---
         self._log_path = self._dir / "events.log"
         self._log_file = open(self._log_path, "w")
+        self._gallery_skip_total = 0
+        self._gallery_skip_by_reason: dict[str, int] = {}
+        self._gallery_skip_by_tid: dict[int, dict[str, int]] = defaultdict(dict)
 
         self._t0 = time.perf_counter()
         self._write_event("=== Debug session started ===")
@@ -223,6 +229,43 @@ class DebugLogger:
             f"  LOST    frame={frame_idx}  tid={tid}  (track removed)"
         )
 
+    def log_gallery_skip(
+        self,
+        frame_idx: int,
+        tid: int,
+        reason: str,
+        confidence: float | None = None,
+        crop_area: int | None = None,
+    ) -> None:
+        if not self._enabled:
+            return
+        self._gallery_skip_total += 1
+        self._gallery_skip_by_reason[reason] = self._gallery_skip_by_reason.get(reason, 0) + 1
+        per_tid = self._gallery_skip_by_tid[tid]
+        per_tid[reason] = per_tid.get(reason, 0) + 1
+        details = []
+        if confidence is not None and np.isfinite(confidence):
+            details.append(f"conf={confidence:.3f}")
+        if crop_area is not None:
+            details.append(f"crop_area={crop_area}")
+        suffix = "" if not details else "  " + "  ".join(details)
+        self._write_event(
+            f"  G_SKIP  frame={frame_idx}  tid={tid}  reason={reason}{suffix}"
+        )
+
+    def log_gallery_prototypes(
+        self,
+        frame_idx: int,
+        tid: int,
+        count: int,
+        source: str = "update",
+    ) -> None:
+        if not self._enabled:
+            return
+        self._write_event(
+            f"  G_BANK  frame={frame_idx}  tid={tid}  count={count}  source={source}"
+        )
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -231,6 +274,7 @@ class DebugLogger:
         if not self._enabled:
             return
         elapsed = time.perf_counter() - self._t0
+        self._write_gallery_skip_summary()
         self._write_event(f"=== Debug session ended ({elapsed:.1f}s) ===")
         self._csv_file.close()
         self._log_file.close()
@@ -244,3 +288,36 @@ class DebugLogger:
         elapsed = time.perf_counter() - self._t0
         self._log_file.write(f"[{elapsed:8.3f}] {msg}\n")
         self._log_file.flush()
+
+    def _write_gallery_skip_summary(self) -> None:
+        if self._gallery_skip_total <= 0:
+            return
+        self._write_event("=== Gallery Skip Summary ===")
+        self._write_event(f"  G_SKIP_SUMMARY total={self._gallery_skip_total}")
+
+        reason_parts = [
+            f"{reason}={count}"
+            for reason, count in sorted(
+                self._gallery_skip_by_reason.items(),
+                key=lambda item: (-item[1], item[0]),
+            )
+        ]
+        if reason_parts:
+            self._write_event("  G_SKIP_BY_REASON " + "  ".join(reason_parts))
+
+        for tid, reason_counts in sorted(
+            self._gallery_skip_by_tid.items(),
+            key=lambda item: (-sum(item[1].values()), item[0]),
+        ):
+            tid_total = sum(reason_counts.values())
+            parts = [
+                f"{reason}={count}"
+                for reason, count in sorted(
+                    reason_counts.items(),
+                    key=lambda item: (-item[1], item[0]),
+                )
+            ]
+            suffix = "" if not parts else "  " + "  ".join(parts)
+            self._write_event(
+                f"  G_SKIP_BY_TID tid={tid}  total={tid_total}{suffix}"
+            )

@@ -975,12 +975,20 @@ def run(cfg: dict, save_path: str | None = None, display: bool = False, debug: b
                 lifetime        = gcfg.get("lifetime", 90),
                 ema_alpha       = gcfg.get("ema_alpha", 0.85),
                 match_threshold = gcfg.get("match_threshold", 0.28),
+                min_crop_area   = gcfg.get("min_crop_area", 800),
+                min_update_conf = gcfg.get("min_update_conf", 0.0),
                 drift_threshold = gcfg.get("drift_threshold", 0.6),
                 merge_area_ratio = gcfg.get("merge_area_ratio", 1.5),
+                merge_release_ratio = gcfg.get("merge_release_ratio", None),
+                merge_hold_frames = gcfg.get("merge_hold_frames", 45),
+                max_prototypes  = gcfg.get("max_prototypes", 5),
                 debug_logger    = dbg,
             )
             print(f"[Gallery] Re-ID recovery enabled  lifetime={gallery._lifetime}  "
-                  f"threshold={gallery._threshold}  merge_ratio={gallery._merge_area_ratio}")
+                  f"threshold={gallery._threshold}  merge_ratio={gallery._merge_area_ratio}  "
+                  f"merge_release={gallery._merge_release_ratio}  merge_hold={gallery._merge_hold_frames}  "
+                  f"max_prototypes={gallery._max_prototypes}  min_update_conf={gallery._min_update_conf}  "
+                  f"min_crop_area={gallery._min_area}")
 
     # Histogram gallery for lightweight Re-ID recovery (ByteTrack path)
     hist_gallery = None
@@ -1184,6 +1192,7 @@ def run(cfg: dict, save_path: str | None = None, display: bool = False, debug: b
                 confirmed_ids  = {int(t[4]) for t in tracks}
                 crops_by_tid   = {}
                 bboxes_by_tid  = {}
+                update_confidences = {}
                 fh2, fw2       = frame.shape[:2]
 
                 # Reuse embeddings from tracker path → avoid re-computing
@@ -1195,12 +1204,14 @@ def run(cfg: dict, save_path: str | None = None, display: bool = False, debug: b
                                         min(fw2,int(t[2])), min(fh2,int(t[3])))
                     crops_by_tid[tid2] = frame[by1:by2, bx1:bx2]
                     bboxes_by_tid[tid2] = np.array([bx1, by1, bx2, by2], dtype=float)
+                    update_confidences[tid2] = float(t[5]) if len(t) > 5 else 1.0
                     if reid_embedder is not None and 0 <= det_idx < len(real_embs):
                         precomputed[tid2] = np.array(real_embs[det_idx], dtype=np.float32)
 
                 id_remap = gallery.update(confirmed_ids, crops_by_tid,
                                           precomputed_embeddings=precomputed if precomputed else None,
                                           bboxes_by_tid=bboxes_by_tid,
+                                          update_confidences=update_confidences,
                                           frame_idx=frame_idx)
 
                 # Apply remap: transfer smoother + counter state
@@ -1340,6 +1351,7 @@ def run(cfg: dict, save_path: str | None = None, display: bool = False, debug: b
                     confirmed_ids = {int(track.track_id) for track in confirmed_tracks}
                     crops_by_tid = {}
                     bboxes_by_tid = {}
+                    update_confidences = {}
                     fh2, fw2 = frame.shape[:2]
                     # Build precomputed embeddings from tracker's real_embs
                     track_embeddings = {}
@@ -1350,6 +1362,8 @@ def run(cfg: dict, save_path: str | None = None, display: bool = False, debug: b
                         bx2, by2 = min(fw2, int(bx2)), min(fh2, int(by2))
                         crops_by_tid[tid2] = frame[by1:by2, bx1:bx2]
                         bboxes_by_tid[tid2] = np.array([bx1, by1, bx2, by2], dtype=float)
+                        det_conf = track.get_det_conf()
+                        update_confidences[tid2] = float(det_conf if det_conf is not None else 0.5)
                         # Map detection index to track embedding if available
                         det_idx = getattr(track, 'det_idx', None)
                         if det_idx is not None and det_idx < len(real_embs):
@@ -1358,6 +1372,7 @@ def run(cfg: dict, save_path: str | None = None, display: bool = False, debug: b
                         confirmed_ids, crops_by_tid,
                         precomputed_embeddings=track_embeddings if track_embeddings else None,
                         bboxes_by_tid=bboxes_by_tid,
+                        update_confidences=update_confidences,
                         frame_idx=frame_idx,
                     )
 
@@ -1605,18 +1620,24 @@ def run(cfg: dict, save_path: str | None = None, display: bool = False, debug: b
                     crops_by_tid_nw: dict[int, np.ndarray] = {}
                     bboxes_by_tid_nw: dict[int, np.ndarray] = {}
                     precomp_nw: dict[int, np.ndarray] = {}
+                    update_confidences_nw: dict[int, float] = {}
                     for t in confirmed_tracks_nw:
                         tlbr = t.to_tlbr()
                         bx1 = max(0, int(tlbr[0])); by1 = max(0, int(tlbr[1]))
                         bx2 = min(fw2, int(tlbr[2])); by2 = min(fh2, int(tlbr[3]))
                         crops_by_tid_nw[t.track_id] = frame[by1:by2, bx1:bx2]
                         bboxes_by_tid_nw[t.track_id] = np.array([bx1, by1, bx2, by2], dtype=float)
+                        update_confidences_nw[t.track_id] = (
+                            0.0 if t.time_since_update > 0
+                            else min(1.0, t.hits / max(t._n_init, 1)) * 0.9 + 0.1
+                        )
                         if t.features:
                             precomp_nw[t.track_id] = np.asarray(t.features[-1], dtype=np.float32)
                     nwojke_id_remap = gallery.update(
                         confirmed_ids_nw, crops_by_tid_nw,
                         precomputed_embeddings=precomp_nw if precomp_nw else None,
                         bboxes_by_tid=bboxes_by_tid_nw,
+                        update_confidences=update_confidences_nw,
                         frame_idx=frame_idx,
                     )
                     nwojke_id_remap = _apply_id_remap(

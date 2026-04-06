@@ -17,6 +17,8 @@ Counting strategy:
     (early trigger), so counts appear promptly.
   - When the person exits the zone, their state is cached briefly (refractory)
     so a quick re-entry resumes rather than restarts.
+  - Counted tracks also get a short exit grace so boundary jitter or merge-driven
+    box wobble does not split one visit into two visits.
   - When tracking briefly loses a counted person during an overlap, a nearby
     replacement ID can inherit the counted state to avoid duplicate counts.
 """
@@ -36,11 +38,12 @@ def _center_distance(a: Tuple[float, float], b: Tuple[float, float]) -> float:
 class _ZoneState:
     """Per-track zone state."""
 
-    __slots__ = ("entry_time", "counted")
+    __slots__ = ("entry_time", "counted", "outside_since")
 
     def __init__(self, entry_time: float):
         self.entry_time: float = entry_time
         self.counted: bool = False  # True once the dwell threshold is reached
+        self.outside_since: float | None = None
 
 
 _ZoneHandoff = Tuple[_ZoneState, Tuple[float, float], float]
@@ -60,6 +63,7 @@ class ZoneCounter(BaseCounter):
         self.polygon: List[Tuple[float, float]] = [tuple(p) for p in config["points"]]
         self.min_dwell: float = float(config.get("min_dwell_seconds", 2.0))
         self._refractory_sec: float = float(config.get("refractory_seconds", 0.17))
+        self._exit_grace_sec: float = float(config.get("exit_grace_seconds", max(self._refractory_sec, 0.4)))
         self._handoff_sec: float = float(config.get("handoff_seconds", max(self._refractory_sec, 2.0)))
         self._handoff_radius: float = float(config.get("handoff_radius_px", 70.0))
 
@@ -88,6 +92,14 @@ class ZoneCounter(BaseCounter):
         result = {"counted": False}
 
         if inside:
+            if state is not None and state.outside_since is not None:
+                outside_gap = float(timestamp) - float(state.outside_since)
+                if outside_gap >= self._exit_grace_sec:
+                    self._finalize_exit(track_id, state, float(state.outside_since))
+                    state = None
+                else:
+                    state.outside_since = None
+
             if state is None:
                 # Check if re-entering within refractory period
                 exited = self._exited.pop(track_id, None)
@@ -109,6 +121,7 @@ class ZoneCounter(BaseCounter):
                     self._states[track_id] = _ZoneState(entry_time=timestamp)
                     state = self._states[track_id]
 
+            state.outside_since = None
             if not state.counted:
                 dwell = timestamp - state.entry_time
                 if dwell >= self.min_dwell:
@@ -117,9 +130,13 @@ class ZoneCounter(BaseCounter):
                     result["counted"] = True
         else:
             if state is not None:
-                # Person left the zone — cache state for refractory period
-                self._exited[track_id] = (state, timestamp)
-                del self._states[track_id]
+                if state.outside_since is None:
+                    state.outside_since = float(timestamp)
+                    if self._exit_grace_sec <= 0.0:
+                        self._finalize_exit(track_id, state, float(state.outside_since))
+                elif float(timestamp) - float(state.outside_since) >= self._exit_grace_sec:
+                    # Person was outside long enough to treat this as a real exit.
+                    self._finalize_exit(track_id, state, float(state.outside_since))
 
         return result
 
@@ -136,6 +153,10 @@ class ZoneCounter(BaseCounter):
 
         state = self._states.pop(track_id, None)
         if state is None or not state.counted:
+            return
+
+        if state.outside_since is not None:
+            self._exited[track_id] = (state, float(state.outside_since))
             return
 
         self._handoff[track_id] = (
@@ -163,6 +184,10 @@ class ZoneCounter(BaseCounter):
             else:
                 to_state.entry_time = min(to_state.entry_time, from_state.entry_time)
                 to_state.counted = to_state.counted or from_state.counted
+                if to_state.outside_since is None or from_state.outside_since is None:
+                    to_state.outside_since = None
+                else:
+                    to_state.outside_since = min(to_state.outside_since, from_state.outside_since)
 
         from_exited = self._exited.pop(from_tid, None)
         if from_exited is not None and to_tid not in self._states:
@@ -245,3 +270,8 @@ class ZoneCounter(BaseCounter):
 
         state, _, _ = self._handoff.pop(best_tid)
         return state
+
+    def _finalize_exit(self, track_id: int, state: _ZoneState, exit_ts: float) -> None:
+        state.outside_since = None
+        self._exited[track_id] = (state, float(exit_ts))
+        self._states.pop(track_id, None)

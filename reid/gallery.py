@@ -73,6 +73,60 @@ def _match_quality_reward(quality: tuple[float, float, float]) -> float:
     return float(tier) * 1_000_000.0 + float(score) * 1_000.0 + float(recency)
 
 
+def _normalize_feature(feature: np.ndarray | list | tuple | None) -> np.ndarray | None:
+    if feature is None:
+        return None
+    arr = np.asarray(feature, dtype=np.float32).reshape(-1)
+    if arr.size == 0 or not np.all(np.isfinite(arr)):
+        return None
+    norm = float(np.linalg.norm(arr))
+    if norm <= 1e-6:
+        return None
+    return arr / norm
+
+
+def _clone_feature_bank(bank: list[np.ndarray] | None) -> list[np.ndarray]:
+    if not bank:
+        return []
+    return [np.asarray(feature, dtype=np.float32).copy() for feature in bank]
+
+
+def _feature_bank_centroid(bank: list[np.ndarray] | None) -> np.ndarray | None:
+    if not bank:
+        return None
+    stacked = np.asarray(bank, dtype=np.float32)
+    if stacked.ndim != 2 or stacked.shape[0] == 0:
+        return None
+    centroid = stacked.mean(axis=0)
+    return _normalize_feature(centroid)
+
+
+def _feature_distance_to_bank(
+    feature: np.ndarray | None,
+    representative: np.ndarray | None,
+    bank: list[np.ndarray] | None,
+) -> float | None:
+    feature = _normalize_feature(feature)
+    if feature is None:
+        return None
+
+    distances = []
+    rep = _normalize_feature(representative)
+    if rep is not None:
+        distances.append(1.0 - float(np.dot(feature, rep)))
+
+    if bank:
+        for prototype in bank:
+            proto = _normalize_feature(prototype)
+            if proto is None:
+                continue
+            distances.append(1.0 - float(np.dot(feature, proto)))
+
+    if not distances:
+        return None
+    return min(distances)
+
+
 class TrackGallery:
     """
     Args:
@@ -94,6 +148,8 @@ class TrackGallery:
         min_crop_area: int = 800,
         drift_threshold: float = 0.6,
         merge_area_ratio: float = 1.5,
+        merge_release_ratio: float | None = None,
+        merge_hold_frames: int = 45,
         drift_confirm_frames: int = 2,
         spatial_match_window: int = 12,
         spatial_iou_threshold: float = 0.45,
@@ -105,6 +161,8 @@ class TrackGallery:
         active_conflict_iou: float = 0.30,
         active_conflict_area_ratio: float = 0.55,
         active_conflict_center_ratio: float = 0.35,
+        max_prototypes: int = 5,
+        min_update_conf: float = 0.0,
         debug_logger=None,
     ):
         self._embedder = embedder
@@ -112,8 +170,15 @@ class TrackGallery:
         self._alpha = ema_alpha
         self._threshold = match_threshold
         self._min_area = min_crop_area
+        self._min_update_conf = float(min_update_conf)
         self._drift_thresh = drift_threshold
         self._merge_area_ratio = merge_area_ratio
+        release_default = 1.0 + max(merge_area_ratio - 1.0, 0.0) * 0.5
+        self._merge_release_ratio = min(
+            merge_area_ratio,
+            max(1.0, release_default if merge_release_ratio is None else float(merge_release_ratio)),
+        )
+        self._merge_hold_frames = max(1, int(merge_hold_frames))
         self._drift_confirm = max(1, int(drift_confirm_frames))
         self._spatial_window = max(0, int(spatial_match_window))
         self._spatial_iou = spatial_iou_threshold
@@ -137,12 +202,17 @@ class TrackGallery:
         self._long_gap_remap_dist_ratio: float = 3.0
         self._long_gap_area_ratio: float = 0.25
         self._active_conflict_containment: float = 0.80
+        self._max_prototypes = max(1, int(max_prototypes))
 
-        # {track_id: np.ndarray} — L2-normalised feature
+        # {track_id: np.ndarray} — representative feature for active tracks
         self._active: dict[int, np.ndarray] = {}
+        # {track_id: [feature0, feature1, ...]} — recent good embeddings
+        self._active_banks: dict[int, list[np.ndarray]] = {}
 
-        # {track_id: [feature, frames_since_lost, last_bbox]}
+        # {track_id: [representative_feature, frames_since_lost, last_bbox]}
         self._lost: dict[int, list] = {}
+        # {track_id: [feature0, feature1, ...]} — prototype bank retained while lost
+        self._lost_banks: dict[int, list[np.ndarray]] = {}
 
         # {track_id: float} — last known crop area, for merge detection
         self._last_area: dict[int, float] = {}
@@ -155,6 +225,8 @@ class TrackGallery:
 
         # {track_id: float} — area before the merge event (for split detection)
         self._pre_merge_area: dict[int, float] = {}
+        # {track_id: int} — consecutive frames spent in merge-freeze state
+        self._merge_counts: dict[int, int] = {}
 
         # {track_id: int} — consecutive drift frames before we trust the signal
         self._drift_counts: dict[int, int] = {}
@@ -166,6 +238,7 @@ class TrackGallery:
         crops_by_tid: dict[int, np.ndarray],
         precomputed_embeddings: dict[int, np.ndarray] | None = None,
         bboxes_by_tid: dict[int, np.ndarray] | None = None,
+        update_confidences: dict[int, float] | None = None,
         frame_idx: int = 0,
     ) -> dict[int, int]:
         """Call once per frame after the tracker returns confirmed tracks."""
@@ -174,26 +247,36 @@ class TrackGallery:
             for tid, bbox in bboxes_by_tid.items():
                 self._last_bbox[tid] = np.asarray(bbox, dtype=float)
 
-        if precomputed_embeddings is not None:
-            embeddings = precomputed_embeddings
-        else:
-            embeddings = self._batch_embed(confirmed_ids, crops_by_tid)
+        embeddings = self._prepare_embeddings(
+            confirmed_ids,
+            crops_by_tid,
+            precomputed_embeddings=precomputed_embeddings,
+        )
 
         self._detect_merges(confirmed_ids, bboxes_by_tid)
         self._detect_identity_drift(confirmed_ids, embeddings)
         self._age_lost_gallery(confirmed_ids)
         id_remap = self._recover_ids(confirmed_ids, embeddings, bboxes_by_tid)
-        self._update_active(confirmed_ids, embeddings, id_remap)
+        self._update_active(
+            confirmed_ids,
+            embeddings,
+            id_remap,
+            crops_by_tid=crops_by_tid,
+            update_confidences=update_confidences,
+        )
         return id_remap
 
     def remove(self, track_id: int) -> None:
         """Permanently remove a track (e.g. after lifetime expires in the main loop)."""
         self._active.pop(track_id, None)
+        self._active_banks.pop(track_id, None)
         self._lost.pop(track_id, None)
+        self._lost_banks.pop(track_id, None)
         self._last_area.pop(track_id, None)
         self._last_bbox.pop(track_id, None)
         self._merged_ids.discard(track_id)
         self._pre_merge_area.pop(track_id, None)
+        self._merge_counts.pop(track_id, None)
         self._drift_counts.pop(track_id, None)
 
     # ------------------------------------------------------------------
@@ -225,25 +308,29 @@ class TrackGallery:
                 if ratio >= self._merge_area_ratio and tid not in self._merged_ids:
                     self._merged_ids.add(tid)
                     self._pre_merge_area[tid] = prev_area
+                    self._merge_counts[tid] = 0
                     self._drift_counts.pop(tid, None)
                     if self._dbg is not None:
                         self._dbg.log_merge(self._frame_idx, tid, area, prev_area)
                 elif tid in self._merged_ids:
                     pre_area = self._pre_merge_area.get(tid, prev_area)
-                    if pre_area > 0 and area / pre_area < 1.0 / self._merge_area_ratio:
+                    self._merge_counts[tid] = self._merge_counts.get(tid, 0) + 1
+                    release_ratio = area / pre_area if pre_area > 0 else float("inf")
+                    if pre_area > 0 and release_ratio < 1.0 / self._merge_area_ratio:
                         self._merged_ids.discard(tid)
                         self._pre_merge_area.pop(tid, None)
-                        if tid in self._active:
-                            self._lost[tid] = [
-                                self._active[tid],
-                                0,
-                                self._last_bbox.get(tid),
-                            ]
+                        self._merge_counts.pop(tid, None)
+                        self._snapshot_active_to_lost(tid)
                         if self._dbg is not None:
                             self._dbg.log_split(self._frame_idx, tid)
-                    elif pre_area > 0 and 0.8 <= area / pre_area <= 1.2:
+                    elif pre_area > 0 and release_ratio <= self._merge_release_ratio:
                         self._merged_ids.discard(tid)
                         self._pre_merge_area.pop(tid, None)
+                        self._merge_counts.pop(tid, None)
+                    elif self._merge_counts.get(tid, 0) >= self._merge_hold_frames:
+                        self._merged_ids.discard(tid)
+                        self._pre_merge_area.pop(tid, None)
+                        self._merge_counts.pop(tid, None)
 
             self._last_area[tid] = area
 
@@ -257,7 +344,7 @@ class TrackGallery:
         crops = []
         for tid in confirmed_ids:
             crop = crops_by_tid.get(tid)
-            if crop is not None and crop.size >= self._min_area:
+            if self._crop_area(crop) >= self._min_area:
                 tids.append(tid)
                 crops.append(crop)
 
@@ -271,8 +358,148 @@ class TrackGallery:
 
         embeddings = {}
         for tid, vec in zip(tids, vecs):
-            embeddings[tid] = np.array(vec, dtype=np.float32)
+            feature = _normalize_feature(vec)
+            if feature is not None:
+                embeddings[tid] = feature
         return embeddings
+
+    def _crop_area(self, crop: np.ndarray | None) -> int:
+        if crop is None or crop.ndim < 2:
+            return 0
+        return int(crop.shape[0] * crop.shape[1])
+
+    def _prepare_embeddings(
+        self,
+        confirmed_ids: set[int],
+        crops_by_tid: dict[int, np.ndarray],
+        precomputed_embeddings: dict[int, np.ndarray] | None = None,
+    ) -> dict[int, np.ndarray]:
+        if precomputed_embeddings is not None:
+            raw_embeddings = precomputed_embeddings
+        else:
+            raw_embeddings = self._batch_embed(confirmed_ids, crops_by_tid)
+
+        embeddings: dict[int, np.ndarray] = {}
+        for tid in confirmed_ids:
+            if self._crop_area(crops_by_tid.get(tid)) < self._min_area:
+                continue
+            feature = _normalize_feature(raw_embeddings.get(tid))
+            if feature is not None:
+                embeddings[tid] = feature
+        return embeddings
+
+    def _snapshot_active_to_lost(self, tid: int) -> None:
+        representative = self._active.get(tid)
+        representative = _normalize_feature(representative)
+        if representative is None:
+            return
+        self._lost[tid] = [representative, 0, self._last_bbox.get(tid)]
+        bank = self._active_banks.get(tid)
+        cloned_bank = _clone_feature_bank(bank)
+        self._lost_banks[tid] = cloned_bank if cloned_bank else [representative.copy()]
+
+    def _move_active_to_lost(self, tid: int) -> None:
+        self._snapshot_active_to_lost(tid)
+        self._active.pop(tid, None)
+        self._active_banks.pop(tid, None)
+        self._drift_counts.pop(tid, None)
+
+    def _restore_lost_to_active(self, new_tid: int, old_tid: int, fallback_feature: np.ndarray | None) -> None:
+        representative, _, _ = self._lost.pop(old_tid)
+        bank = self._lost_banks.pop(old_tid, None)
+        cloned_bank = _clone_feature_bank(bank)
+        if not cloned_bank:
+            fallback = _normalize_feature(fallback_feature if fallback_feature is not None else representative)
+            cloned_bank = [fallback] if fallback is not None else []
+        self._active_banks[new_tid] = cloned_bank
+        centroid = _feature_bank_centroid(cloned_bank)
+        if centroid is None:
+            centroid = _normalize_feature(representative)
+        if centroid is not None:
+            self._active[new_tid] = centroid
+
+        if self._dbg is not None:
+            self._dbg.log_gallery_prototypes(
+                self._frame_idx,
+                new_tid,
+                len(cloned_bank),
+                source="restore",
+            )
+
+    def _update_acceptance_status(
+        self,
+        tid: int,
+        crops_by_tid: dict[int, np.ndarray],
+        update_confidences: dict[int, float] | None,
+    ) -> tuple[bool, str | None, int, float | None]:
+        crop_area = self._crop_area(crops_by_tid.get(tid))
+        if crop_area < self._min_area:
+            return False, "small_crop", crop_area, None
+        if update_confidences is None:
+            return True, None, crop_area, None
+        try:
+            confidence = float(update_confidences.get(tid, 1.0))
+        except (TypeError, ValueError):
+            return False, "low_conf", crop_area, None
+        if not np.isfinite(confidence):
+            return False, "low_conf", crop_area, confidence
+        if confidence < self._min_update_conf:
+            return False, "low_conf", crop_area, confidence
+        return True, None, crop_area, confidence
+
+    def _log_update_skip(
+        self,
+        tid: int,
+        reason: str,
+        *,
+        confidence: float | None = None,
+        crop_area: int | None = None,
+    ) -> None:
+        if self._dbg is None:
+            return
+        self._dbg.log_gallery_skip(
+            self._frame_idx,
+            tid,
+            reason=reason,
+            confidence=confidence,
+            crop_area=crop_area,
+        )
+
+    def _append_active_prototype(self, tid: int, new_feat: np.ndarray) -> None:
+        new_feat = _normalize_feature(new_feat)
+        if new_feat is None:
+            return
+
+        bank = _clone_feature_bank(self._active_banks.get(tid))
+        if not bank and tid in self._active:
+            representative = _normalize_feature(self._active.get(tid))
+            if representative is not None:
+                bank.append(representative)
+
+        bank.append(new_feat)
+        if len(bank) > self._max_prototypes:
+            bank = bank[-self._max_prototypes:]
+        self._active_banks[tid] = bank
+
+        centroid = _feature_bank_centroid(bank)
+        if centroid is None:
+            return
+
+        previous = _normalize_feature(self._active.get(tid))
+        if previous is None:
+            self._active[tid] = centroid
+        else:
+            blended = self._alpha * previous + (1.0 - self._alpha) * centroid
+            normalized_blended = _normalize_feature(blended)
+            self._active[tid] = normalized_blended if normalized_blended is not None else centroid
+
+        if self._dbg is not None:
+            self._dbg.log_gallery_prototypes(
+                self._frame_idx,
+                tid,
+                len(bank),
+                source="update",
+            )
 
     def _detect_identity_drift(
         self,
@@ -290,7 +517,14 @@ class TrackGallery:
                 self._drift_counts.pop(tid, None)
                 continue
 
-            dist = 1.0 - float(np.dot(new_feat, self._active[tid]))
+            dist = _feature_distance_to_bank(
+                new_feat,
+                self._active.get(tid),
+                self._active_banks.get(tid),
+            )
+            if dist is None:
+                self._drift_counts.pop(tid, None)
+                continue
             if dist <= self._drift_thresh:
                 self._drift_counts.pop(tid, None)
                 continue
@@ -301,16 +535,16 @@ class TrackGallery:
                 continue
 
             self._drift_counts.pop(tid, None)
-            self._lost[tid] = [self._active[tid], 0, self._last_bbox.get(tid)]
+            self._snapshot_active_to_lost(tid)
             self._active[tid] = new_feat
+            self._active_banks[tid] = [new_feat.copy()]
             if self._dbg is not None:
                 self._dbg.log_drift(self._frame_idx, tid, dist)
 
     def _age_lost_gallery(self, confirmed_ids: set[int]) -> None:
         """Move newly-lost tracks to lost gallery; age and evict expired ones."""
         for tid in set(self._active) - confirmed_ids:
-            self._lost[tid] = [self._active.pop(tid), 0, self._last_bbox.get(tid)]
-            self._drift_counts.pop(tid, None)
+            self._move_active_to_lost(tid)
 
         expired = [
             tid for tid, (_, age, _) in self._lost.items()
@@ -318,6 +552,7 @@ class TrackGallery:
         ]
         for tid in expired:
             del self._lost[tid]
+            self._lost_banks.pop(tid, None)
 
         for entry in self._lost.values():
             entry[1] += 1
@@ -480,9 +715,11 @@ class TrackGallery:
                 if self._has_active_conflict(new_tid, confirmed_ids, bboxes_by_tid, new_bbox, old_bbox):
                     continue
 
-                dist = None
-                if new_feat is not None:
-                    dist = 1.0 - float(np.dot(new_feat, old_feat))
+                dist = _feature_distance_to_bank(
+                    new_feat,
+                    old_feat,
+                    self._lost_banks.get(old_tid),
+                )
 
                 spatial_quality = self._spatial_match_quality(new_bbox, old_bbox, age)
                 quality = None
@@ -548,9 +785,9 @@ class TrackGallery:
 
             new_tid = new_ids[row]
             old_tid = lost_ids[col]
-            old_feat, _, _ = self._lost.pop(old_tid)
+            old_feat, _, _ = self._lost[old_tid]
             id_remap[new_tid] = old_tid
-            self._active[new_tid] = old_feat
+            self._restore_lost_to_active(new_tid, old_tid, fallback_feature=old_feat)
 
             new_bbox = None if bboxes_by_tid is None else bboxes_by_tid.get(new_tid)
             if new_bbox is not None:
@@ -564,25 +801,39 @@ class TrackGallery:
         confirmed_ids: set[int],
         embeddings: dict[int, np.ndarray],
         id_remap: dict[int, int],
+        *,
+        crops_by_tid: dict[int, np.ndarray],
+        update_confidences: dict[int, float] | None,
     ) -> None:
-        """EMA-update features for every confirmed track."""
+        """Update representative features using a bounded prototype bank."""
         for tid in confirmed_ids:
+            accept_update, skip_reason, crop_area, confidence = self._update_acceptance_status(
+                tid,
+                crops_by_tid,
+                update_confidences,
+            )
             new_feat = embeddings.get(tid)
-            if new_feat is None:
-                continue
 
             if tid in self._merged_ids:
-                if tid not in self._active:
-                    self._active[tid] = new_feat
+                if tid not in self._active and accept_update and new_feat is not None:
+                    self._append_active_prototype(tid, new_feat)
+                elif tid in self._active:
+                    self._log_update_skip(tid, "merged", confidence=confidence, crop_area=crop_area)
+                elif not accept_update and skip_reason is not None:
+                    self._log_update_skip(tid, skip_reason, confidence=confidence, crop_area=crop_area)
                 continue
 
             # Hold the existing feature while drift is still only a tentative signal.
             if tid in self._drift_counts and tid in self._active:
+                self._log_update_skip(tid, "drift_hold", confidence=confidence, crop_area=crop_area)
                 continue
 
-            if tid in self._active:
-                blended = self._alpha * self._active[tid] + (1 - self._alpha) * new_feat
-                norm = np.linalg.norm(blended)
-                self._active[tid] = blended / norm if norm > 1e-6 else new_feat
-            else:
-                self._active[tid] = new_feat
+            if not accept_update:
+                if skip_reason is not None:
+                    self._log_update_skip(tid, skip_reason, confidence=confidence, crop_area=crop_area)
+                continue
+
+            if new_feat is None:
+                continue
+
+            self._append_active_prototype(tid, new_feat)
