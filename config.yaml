@@ -150,7 +150,7 @@ tracker:
     downsample: 2
 
 counting:
-  mode: "line"   # line | zone | both
+  mode: "zone"   # line | zone | both
 
   crosslines:
     - id: "line_entrance"
