@@ -40,6 +40,24 @@ def _bbox_iou(box_a: np.ndarray | None, box_b: np.ndarray | None) -> float:
     return inter / union if union > 0 else 0.0
 
 
+def _bbox_inter_over_smaller(box_a: np.ndarray | None, box_b: np.ndarray | None) -> float:
+    if box_a is None or box_b is None:
+        return 0.0
+    ax1, ay1, ax2, ay2 = np.asarray(box_a, dtype=float)
+    bx1, by1, bx2, by2 = np.asarray(box_b, dtype=float)
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    inter = float((ix2 - ix1) * (iy2 - iy1))
+    area_a = float(max(ax2 - ax1, 0.0) * max(ay2 - ay1, 0.0))
+    area_b = float(max(bx2 - bx1, 0.0) * max(by2 - by1, 0.0))
+    smaller = min(area_a, area_b)
+    return inter / smaller if smaller > 0 else 0.0
+
+
 def _bbox_center_distance(box_a: np.ndarray | None, box_b: np.ndarray | None) -> float:
     if box_a is None or box_b is None:
         return float('inf')
@@ -81,6 +99,8 @@ class TrackGallery:
         spatial_iou_threshold: float = 0.45,
         spatial_area_ratio: float = 0.60,
         spatial_center_ratio: float = 0.30,
+        spatial_containment_threshold: float = 0.82,
+        spatial_containment_center_ratio: float = 0.55,
         relaxed_match_threshold: float | None = None,
         active_conflict_iou: float = 0.30,
         active_conflict_area_ratio: float = 0.55,
@@ -99,6 +119,8 @@ class TrackGallery:
         self._spatial_iou = spatial_iou_threshold
         self._spatial_area_ratio = spatial_area_ratio
         self._spatial_center_ratio = spatial_center_ratio
+        self._spatial_containment = spatial_containment_threshold
+        self._spatial_containment_center_ratio = spatial_containment_center_ratio
         self._active_conflict_iou = active_conflict_iou
         self._active_conflict_area_ratio = active_conflict_area_ratio
         self._active_conflict_center_ratio = active_conflict_center_ratio
@@ -405,10 +427,9 @@ class TrackGallery:
         new_area = float(max((new_bbox[2] - new_bbox[0]) * (new_bbox[3] - new_bbox[1]), 1.0))
         old_area = float(max((old_bbox[2] - old_bbox[0]) * (old_bbox[3] - old_bbox[1]), 1.0))
         area_ratio = min(new_area, old_area) / max(new_area, old_area)
-        if area_ratio < self._spatial_area_ratio:
-            return None
 
         iou = _bbox_iou(new_bbox, old_bbox)
+        inter_over_smaller = _bbox_inter_over_smaller(new_bbox, old_bbox)
         center_dist = _bbox_center_distance(new_bbox, old_bbox)
         diag_ref = max(
             min(
@@ -418,11 +439,20 @@ class TrackGallery:
             1.0,
         )
         center_limit = self._spatial_center_ratio * diag_ref
-        if iou < self._spatial_iou and center_dist > center_limit:
+        containment_limit = self._spatial_containment_center_ratio * diag_ref
+        containment_ok = (
+            inter_over_smaller >= self._spatial_containment
+            and center_dist <= containment_limit
+        )
+
+        if area_ratio < self._spatial_area_ratio and not containment_ok:
+            return None
+        if iou < self._spatial_iou and center_dist > center_limit and not containment_ok:
             return None
 
         center_score = max(0.0, 1.0 - center_dist / max(center_limit, 1.0))
-        return iou, area_ratio, center_score
+        size_score = max(area_ratio, inter_over_smaller if containment_ok else 0.0)
+        return iou, size_score, center_score
 
     def _recover_ids(
         self,

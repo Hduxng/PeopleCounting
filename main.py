@@ -418,7 +418,7 @@ def _build_reid_embedder(
 
     # OSNet path
     model_name = reid_cfg.get("model", "osnet_x1_0")
-    weights    = _prefer_onnx_sibling(reid_cfg.get("osnet_weights") or reid_cfg.get("weights") or None)
+    weights    = _prefer_onnx_sibling(reid_cfg.get("osnet_weights") or None)
     tta        = reid_cfg.get("tta", False)
 
     try:
@@ -547,6 +547,22 @@ def _bbox_iou(box_a: np.ndarray, box_b: np.ndarray) -> float:
     return inter / union if union > 0 else 0.0
 
 
+def _bbox_inter_over_smaller(box_a: np.ndarray, box_b: np.ndarray) -> float:
+    ax1, ay1, ax2, ay2 = box_a
+    bx1, by1, bx2, by2 = box_b
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0.0
+    inter = float((ix2 - ix1) * (iy2 - iy1))
+    area_a = float(max(ax2 - ax1, 0.0) * max(ay2 - ay1, 0.0))
+    area_b = float(max(bx2 - bx1, 0.0) * max(by2 - by1, 0.0))
+    smaller = min(area_a, area_b)
+    return inter / smaller if smaller > 0 else 0.0
+
+
 def _axis_overlap_ratio(a1: float, a2: float, b1: float, b2: float) -> float:
     overlap = max(0.0, min(a2, b2) - max(a1, b1))
     denom = max(min(a2 - a1, b2 - b1), 1.0)
@@ -572,6 +588,76 @@ def _prefer_track_candidate(candidate, current) -> bool:
         -int(current.track_id),
     )
     return cand_score > curr_score
+
+
+def _track_bbox(track) -> np.ndarray | None:
+    if hasattr(track, "to_tlbr"):
+        return np.asarray(track.to_tlbr(), dtype=float)
+    if hasattr(track, "to_ltrb"):
+        return np.asarray(track.to_ltrb(), dtype=float)
+    return None
+
+
+def _track_latest_feature(track) -> np.ndarray | None:
+    features = getattr(track, "features", None)
+    if not features:
+        return None
+    feat = np.asarray(features[-1], dtype=np.float32).reshape(-1)
+    norm = float(np.linalg.norm(feat))
+    if norm <= 1e-6:
+        return None
+    return feat / norm
+
+
+def _feature_distance(feat_a: np.ndarray | None, feat_b: np.ndarray | None) -> float | None:
+    if feat_a is None or feat_b is None:
+        return None
+    return 1.0 - float(np.clip(np.dot(feat_a, feat_b), -1.0, 1.0))
+
+
+def _prefer_canonical_track_candidate(
+    candidate,
+    current,
+    *,
+    canonical_tid: int,
+    smoother: _BboxSmoother,
+    locality_ratio: float = 0.65,
+    locality_margin_px: float = 12.0,
+) -> bool:
+    """
+    Prefer the raw track that stays spatially closer to the canonical track's
+    previous position. This avoids a canonical ID hopping to a farther-away
+    person when duplicate raw tracks briefly coexist.
+    """
+    ref_bbox = smoother._state.get(canonical_tid)
+    if ref_bbox is None:
+        return _prefer_track_candidate(candidate, current)
+
+    candidate_bbox = _track_bbox(candidate)
+    current_bbox = _track_bbox(current)
+    if candidate_bbox is None or current_bbox is None:
+        return _prefer_track_candidate(candidate, current)
+
+    ref_center = np.asarray(get_bbox_center(ref_bbox), dtype=float)
+    cand_center = np.asarray(get_bbox_center(candidate_bbox), dtype=float)
+    curr_center = np.asarray(get_bbox_center(current_bbox), dtype=float)
+    cand_dist = float(np.linalg.norm(cand_center - ref_center))
+    curr_dist = float(np.linalg.norm(curr_center - ref_center))
+
+    diag = max(
+        float(np.linalg.norm([ref_bbox[2] - ref_bbox[0], ref_bbox[3] - ref_bbox[1]])),
+        1.0,
+    )
+    local_limit = locality_ratio * diag
+    margin = max(locality_margin_px, 0.15 * diag)
+
+    cand_local = cand_dist <= local_limit
+    curr_local = curr_dist <= local_limit
+    if cand_local != curr_local:
+        return cand_local
+    if abs(cand_dist - curr_dist) > margin:
+        return cand_dist < curr_dist
+    return _prefer_track_candidate(candidate, current)
 
 
 def _transfer_runtime_id_state(
@@ -697,16 +783,22 @@ class _LiveTrackAliasResolver:
     def __init__(
         self,
         iou_threshold: float = 0.55,
+        containment_threshold: float = 0.82,
         horizontal_overlap_ratio: float = 0.85,
         top_edge_ratio: float = 0.28,
         center_ratio: float = 0.42,
+        containment_center_ratio: float = 0.55,
         width_ratio: float = 0.75,
+        appearance_distance_threshold: float = 0.20,
     ):
         self._iou_threshold = iou_threshold
+        self._containment_threshold = containment_threshold
         self._horizontal_overlap_ratio = horizontal_overlap_ratio
         self._top_edge_ratio = top_edge_ratio
         self._center_ratio = center_ratio
+        self._containment_center_ratio = containment_center_ratio
         self._width_ratio = width_ratio
+        self._appearance_distance_threshold = appearance_distance_threshold
         self._alias: dict[int, int] = {}
 
     def resolve(self, tid: int) -> int:
@@ -764,7 +856,7 @@ class _LiveTrackAliasResolver:
             primary_box = boxes[primary_tid]
             for secondary in ordered[idx + 1:]:
                 secondary_tid = int(secondary.track_id)
-                if self._looks_duplicate(primary_box, boxes[secondary_tid]):
+                if self._looks_duplicate(primary, primary_box, secondary, boxes[secondary_tid]):
                     _union(primary_tid, secondary_tid)
 
         components: dict[int, list] = defaultdict(list)
@@ -792,26 +884,41 @@ class _LiveTrackAliasResolver:
 
         return new_aliases
 
-    def _looks_duplicate(self, box_a: np.ndarray, box_b: np.ndarray) -> bool:
-        if _bbox_iou(box_a, box_b) < self._iou_threshold:
-            return False
-
+    def _looks_duplicate(self, track_a, box_a: np.ndarray, track_b, box_b: np.ndarray) -> bool:
         width_a = max(float(box_a[2] - box_a[0]), 1.0)
         width_b = max(float(box_b[2] - box_b[0]), 1.0)
         height_a = max(float(box_a[3] - box_a[1]), 1.0)
         height_b = max(float(box_b[3] - box_b[1]), 1.0)
         min_height = max(min(height_a, height_b), 1.0)
+        iou = _bbox_iou(box_a, box_b)
+        inter_over_smaller = _bbox_inter_over_smaller(box_a, box_b)
 
-        if min(width_a, width_b) / max(width_a, width_b) < self._width_ratio:
-            return False
-        if _axis_overlap_ratio(box_a[0], box_a[2], box_b[0], box_b[2]) < self._horizontal_overlap_ratio:
-            return False
-        if abs(float(box_a[1] - box_b[1])) > self._top_edge_ratio * min_height:
+        horizontal_overlap = _axis_overlap_ratio(box_a[0], box_a[2], box_b[0], box_b[2])
+        if horizontal_overlap < self._horizontal_overlap_ratio:
             return False
 
         center_a = np.array([(box_a[0] + box_a[2]) * 0.5, (box_a[1] + box_a[3]) * 0.5])
         center_b = np.array([(box_b[0] + box_b[2]) * 0.5, (box_b[1] + box_b[3]) * 0.5])
         center_dist = float(np.linalg.norm(center_a - center_b))
+        feat_dist = _feature_distance(_track_latest_feature(track_a), _track_latest_feature(track_b))
+        if (
+            feat_dist is not None
+            and feat_dist > self._appearance_distance_threshold
+        ):
+            return False
+
+        if (
+            inter_over_smaller >= self._containment_threshold
+            and center_dist <= self._containment_center_ratio * min_height
+        ):
+            return True
+
+        if iou < self._iou_threshold:
+            return False
+        if min(width_a, width_b) / max(width_a, width_b) < self._width_ratio:
+            return False
+        if abs(float(box_a[1] - box_b[1])) > self._top_edge_ratio * min_height:
+            return False
         return center_dist <= self._center_ratio * min_height
 
     def _pick_canonical(self, track_a, track_b, protected_ids: set[int] | None = None):
@@ -1166,8 +1273,12 @@ def run(cfg: dict, save_path: str | None = None, display: bool = False, debug: b
                     draw_track(
                         frame, bbox, tid, center,
                         color=tuple(disp.get("bbox_color", [0, 255, 255])),
+                        id_text_color=tuple(disp.get("id_text_color", [255, 255, 255])),
+                        id_bg_color=tuple(disp.get("id_bg_color", [32, 32, 32])),
+                        center_color=tuple(disp.get("center_color", [255, 0, 255])),
                         show_id=disp.get("show_ids", True),
                         show_center=disp.get("show_centers", True),
+                        font_scale=disp.get("font_scale", 0.6),
                         thickness=disp.get("thickness", 2),
                     )
 
@@ -1319,8 +1430,12 @@ def run(cfg: dict, save_path: str | None = None, display: bool = False, debug: b
                     draw_track(
                         frame, bbox, tid, center,
                         color=tuple(disp.get("bbox_color", [0, 255, 255])),
+                        id_text_color=tuple(disp.get("id_text_color", [255, 255, 255])),
+                        id_bg_color=tuple(disp.get("id_bg_color", [32, 32, 32])),
+                        center_color=tuple(disp.get("center_color", [255, 0, 255])),
                         show_id=disp.get("show_ids", True),
                         show_center=disp.get("show_centers", True),
+                        font_scale=disp.get("font_scale", 0.6),
                         thickness=disp.get("thickness", 2),
                     )
 
@@ -1415,8 +1530,12 @@ def run(cfg: dict, save_path: str | None = None, display: bool = False, debug: b
                     draw_track(
                         frame, bbox, tid, center,
                         color=tuple(disp.get("bbox_color", [0, 255, 255])),
+                        id_text_color=tuple(disp.get("id_text_color", [255, 255, 255])),
+                        id_bg_color=tuple(disp.get("id_bg_color", [32, 32, 32])),
+                        center_color=tuple(disp.get("center_color", [255, 0, 255])),
                         show_id=disp.get("show_ids", True),
                         show_center=disp.get("show_centers", True),
+                        font_scale=disp.get("font_scale", 0.6),
                         thickness=disp.get("thickness", 2),
                     )
 
@@ -1545,7 +1664,12 @@ def run(cfg: dict, save_path: str | None = None, display: bool = False, debug: b
                         live_alias_resolver,
                     )
                     current = selected_tracks.get(canonical_tid)
-                    if current is None or _prefer_track_candidate(track, current):
+                    if current is None or _prefer_canonical_track_candidate(
+                        track,
+                        current,
+                        canonical_tid=canonical_tid,
+                        smoother=smoother,
+                    ):
                         selected_tracks[canonical_tid] = track
                 active_tracks_nw = list(selected_tracks.values())
 
@@ -1603,8 +1727,12 @@ def run(cfg: dict, save_path: str | None = None, display: bool = False, debug: b
                     draw_track(
                         frame, bbox, tid, center,
                         color=tuple(disp.get("bbox_color", [0, 255, 255])),
+                        id_text_color=tuple(disp.get("id_text_color", [255, 255, 255])),
+                        id_bg_color=tuple(disp.get("id_bg_color", [32, 32, 32])),
+                        center_color=tuple(disp.get("center_color", [255, 0, 255])),
                         show_id=disp.get("show_ids", True),
                         show_center=disp.get("show_centers", True),
+                        font_scale=disp.get("font_scale", 0.6),
                         thickness=disp.get("thickness", 2),
                     )
 
@@ -1644,8 +1772,12 @@ def run(cfg: dict, save_path: str | None = None, display: bool = False, debug: b
                         draw_track(
                             frame, bbox, tid, center,
                             color=tuple(disp.get("bbox_color", [0, 255, 255])),
+                            id_text_color=tuple(disp.get("id_text_color", [255, 255, 255])),
+                            id_bg_color=tuple(disp.get("id_bg_color", [32, 32, 32])),
+                            center_color=tuple(disp.get("center_color", [255, 0, 255])),
                             show_id=disp.get("show_ids", True),
                             show_center=disp.get("show_centers", True),
+                            font_scale=disp.get("font_scale", 0.6),
                             thickness=disp.get("thickness", 2),
                         )
 
@@ -1685,6 +1817,9 @@ def run(cfg: dict, save_path: str | None = None, display: bool = False, debug: b
                     frame, c.pt1, c.pt2,
                     counts["in"], counts["out"], c.name,
                     color=tuple(disp.get("line_color", [0, 255, 0])),
+                    text_color=tuple(disp.get("count_text_color", [255, 255, 255])),
+                    label_bg_color=tuple(disp.get("line_label_bg_color", [40, 96, 40])),
+                    font_scale=disp.get("font_scale", 0.6),
                     thickness=disp.get("thickness", 2),
                 )
 
@@ -1694,6 +1829,9 @@ def run(cfg: dict, save_path: str | None = None, display: bool = False, debug: b
                 draw_zone(
                     frame, z.polygon, counts["in"], z.name,
                     color=tuple(disp.get("zone_color", [0, 165, 255])),
+                    text_color=tuple(disp.get("count_text_color", [255, 255, 255])),
+                    label_bg_color=tuple(disp.get("zone_label_bg_color", [0, 96, 176])),
+                    font_scale=disp.get("font_scale", 0.6),
                     thickness=disp.get("thickness", 2),
                 )
 

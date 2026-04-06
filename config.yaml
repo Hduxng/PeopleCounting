@@ -1,5 +1,5 @@
 video:
-  source: test2.mp4           # 0 = webcam, or path to video file e.g. "test2.mp4"
+  source: test3.mp4           # 0 = webcam, or path to video file e.g. "test2.mp4"
   fps_override: null  # null = use video fps; set a number to override
 
 runtime:
@@ -73,8 +73,8 @@ tracker:
     # CLIP-ReID settings (used when type=clip)
     weights: "clip_market1501.pt"
     # OSNet settings (used when type=osnet)
-    model: "osnet_x1_0"                # osnet_x0_25 | osnet_x0_5 | osnet_x0_75 | osnet_x1_0 | osnet_ain_x1_0
-    osnet_weights: "osnet_x1_0.onnx"   # ONNX backend (TensorRT-accelerated); use null to fall back to PyTorch
+    model: "osnet_ain_x1_0"            # osnet_x0_25 | osnet_x0_5 | osnet_x0_75 | osnet_x1_0 | osnet_ain_x1_0
+    osnet_weights: null                # null = use PyTorch torchreid backend; set an .onnx file to use ONNX Runtime
     tta: false                          # test-time augmentation (h-flip) — slower but +1-2% accuracy
 
   # --- BoT-SORT specific params ---
@@ -173,9 +173,14 @@ display:
   show_bbox: true
   show_centers: true
   show_ids: true
-  bbox_color: [0, 255, 255]
-  line_color: [0, 255, 0]
-  zone_color: [0, 165, 255]
+  bbox_color: [255, 255, 0]         # cyan box (BGR)
+  center_color: [255, 0, 255]       # magenta center
+  id_text_color: [255, 255, 255]    # white ID text
+  id_bg_color: [24, 24, 24]         # dark ID label background
+  line_color: [80, 255, 80]         # vivid green line
+  line_label_bg_color: [40, 96, 40] # dark green count label background
+  zone_color: [0, 140, 255]         # orange zone
+  zone_label_bg_color: [0, 96, 176] # darker orange label background
   count_text_color: [255, 255, 255]
   font_scale: 0.6
   thickness: 2

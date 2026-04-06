@@ -55,6 +55,37 @@ def test_short_gap_spatial_recovery_relaxes_noisy_reid_match():
     assert remap == {99: 1}
 
 
+def test_short_gap_spatial_recovery_accepts_large_contained_box():
+    gallery = TrackGallery(
+        embedder=_UnusedEmbedder(),
+        lifetime=30,
+        match_threshold=0.05,
+        relaxed_match_threshold=0.25,
+        spatial_match_window=5,
+    )
+    old_feat = _norm([1.0, 0.0, 0.0])
+    noisy_feat = _norm([0.90, 0.44, 0.0])
+
+    gallery.update(
+        {1},
+        {1: _crop()},
+        precomputed_embeddings={1: old_feat},
+        bboxes_by_tid={1: np.array([100, 100, 150, 240], dtype=float)},
+        frame_idx=0,
+    )
+    gallery.update(set(), {}, precomputed_embeddings={}, bboxes_by_tid={}, frame_idx=1)
+
+    remap = gallery.update(
+        {99},
+        {99: _crop()},
+        precomputed_embeddings={99: noisy_feat},
+        bboxes_by_tid={99: np.array([85, 85, 175, 285], dtype=float)},
+        frame_idx=2,
+    )
+
+    assert remap == {99: 1}
+
+
 def test_identity_drift_requires_confirmation_frames():
     gallery = TrackGallery(
         embedder=_UnusedEmbedder(),

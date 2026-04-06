@@ -10,16 +10,17 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from deep_sort.detection import Detection
 from deep_sort.nn_matching import NearestNeighborDistanceMetric
 from deep_sort.tracker import Tracker
-from main import _LiveTrackAliasResolver
+from main import _BboxSmoother, _LiveTrackAliasResolver, _prefer_canonical_track_candidate
 
 
 class _FakeTrack:
-    def __init__(self, track_id, bbox, hits, age, time_since_update=0):
+    def __init__(self, track_id, bbox, hits, age, time_since_update=0, feature=None):
         self.track_id = track_id
         self._bbox = np.asarray(bbox, dtype=float)
         self.hits = hits
         self.age = age
         self.time_since_update = time_since_update
+        self.features = [] if feature is None else [np.asarray(feature, dtype=np.float32)]
 
     def to_tlbr(self):
         return self._bbox.copy()
@@ -117,6 +118,42 @@ def test_duplicate_against_already_aliased_track_maps_to_root_canonical():
     assert resolver.resolve(130) == 55
 
 
+def test_large_contained_duplicate_still_aliases_to_older_id():
+    resolver = _LiveTrackAliasResolver()
+    stable = _FakeTrack(55, [100.0, 100.0, 150.0, 240.0], hits=220, age=800, time_since_update=1)
+    large_duplicate = _FakeTrack(121, [85.0, 85.0, 175.0, 285.0], hits=3, age=3, time_since_update=0)
+
+    new_aliases = resolver.alias_duplicates([stable, large_duplicate])
+
+    assert new_aliases == {121: 55}
+    assert resolver.resolve(121) == 55
+
+
+def test_spatial_overlap_does_not_alias_when_appearance_is_different():
+    resolver = _LiveTrackAliasResolver(appearance_distance_threshold=0.20)
+    stable = _FakeTrack(
+        55,
+        [100.0, 100.0, 150.0, 240.0],
+        hits=220,
+        age=800,
+        time_since_update=1,
+        feature=[1.0, 0.0, 0.0],
+    )
+    nearby_other = _FakeTrack(
+        121,
+        [85.0, 85.0, 175.0, 285.0],
+        hits=3,
+        age=3,
+        time_since_update=0,
+        feature=[0.0, 1.0, 0.0],
+    )
+
+    new_aliases = resolver.alias_duplicates([stable, nearby_other])
+
+    assert new_aliases == {}
+    assert resolver.resolve(121) == 121
+
+
 def test_duplicate_component_collapses_transitive_chain_to_one_canonical():
     resolver = _LiveTrackAliasResolver()
     stable = _FakeTrack(55, [100.0, 100.0, 200.0, 260.0], hits=220, age=800, time_since_update=1)
@@ -138,3 +175,25 @@ def test_gallery_remap_alias_persists_across_future_frames():
 
     assert resolver.remember_alias(42, 13) == 12
     assert resolver.resolve(42) == 12
+
+
+def test_canonical_track_selection_prefers_spatially_local_raw_track():
+    smoother = _BboxSmoother(alpha=0.6)
+    smoother._state[21] = np.array([420.0, 160.0, 480.0, 300.0], dtype=float)
+
+    current_local = _FakeTrack(56, [422.0, 162.0, 482.0, 302.0], hits=4, age=6, time_since_update=1)
+    far_candidate = _FakeTrack(57, [380.0, 130.0, 440.0, 270.0], hits=20, age=40, time_since_update=0)
+
+    assert _prefer_canonical_track_candidate(
+        far_candidate,
+        current_local,
+        canonical_tid=21,
+        smoother=smoother,
+    ) is False
+
+    assert _prefer_canonical_track_candidate(
+        current_local,
+        far_candidate,
+        canonical_tid=21,
+        smoother=smoother,
+    ) is True
