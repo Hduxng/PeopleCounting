@@ -57,6 +57,98 @@ def _is_onnx_path(path: str | None) -> bool:
     return bool(path) and Path(path).suffix.lower() == ".onnx"
 
 
+def _make_batch_dynamic(weights_path: str) -> str:
+    """
+    Attempt to patch a fixed-batch ONNX model to support dynamic batching.
+
+    Many OSNet ONNX exports use Reshape([1, -1]) before the FC layer, which
+    forces batch_size=1.  Changing this to Reshape([-1, C]) makes the model
+    accept any batch size with identical numerical output.
+
+    Returns the path to the patched model (cached alongside the original),
+    or the original path if patching is not needed or fails.
+    """
+    try:
+        import onnx
+    except ImportError:
+        return weights_path
+
+    original = Path(weights_path)
+    cached = original.with_stem(original.stem + "_dynbatch")
+    if cached.exists():
+        return str(cached)
+
+    try:
+        model = onnx.load(str(original))
+    except Exception:
+        return weights_path
+
+    # Check if input batch dim is already dynamic
+    inp = model.graph.input[0]
+    in_dims = inp.type.tensor_type.shape.dim
+    if not in_dims or not isinstance(in_dims[0].dim_value, int) or in_dims[0].dim_value != 1:
+        return weights_path  # already dynamic or unexpected shape
+
+    # Find Reshape → Gemm pattern at the end of the network
+    # Look for a Constant node that feeds a Reshape with shape [1, -1]
+    node_by_output: dict[str, object] = {}
+    for node in model.graph.node:
+        for out_name in node.output:
+            node_by_output[out_name] = node
+
+    patched = False
+    for node in model.graph.node:
+        if node.op_type != "Reshape" or len(node.input) < 2:
+            continue
+        shape_node = node_by_output.get(node.input[1])
+        if shape_node is None or shape_node.op_type != "Constant":
+            continue
+
+        for attr in shape_node.attribute:
+            if attr.name != "value":
+                continue
+            shape_data = np.frombuffer(attr.t.raw_data, dtype=np.int64)
+            if len(shape_data) == 2 and shape_data[0] == 1 and shape_data[1] == -1:
+                # Find the feature dim from the downstream Gemm weight
+                consumers = [
+                    n for n in model.graph.node
+                    if any(node.output[0] == i for i in n.input)
+                ]
+                feat_dim = None
+                for consumer in consumers:
+                    if consumer.op_type == "Gemm":
+                        for init in model.graph.initializer:
+                            if init.name == consumer.input[1]:
+                                feat_dim = int(init.dims[1])
+                                break
+                        break
+
+                if feat_dim is not None:
+                    new_shape = np.array([-1, feat_dim], dtype=np.int64)
+                    attr.t.raw_data = new_shape.tobytes()
+                    patched = True
+
+    if not patched:
+        return weights_path
+
+    # Make input/output batch dimensions dynamic
+    in_dims[0].dim_param = "batch"
+    in_dims[0].ClearField("dim_value")
+
+    out = model.graph.output[0]
+    out_dims = out.type.tensor_type.shape.dim
+    if out_dims and isinstance(out_dims[0].dim_value, int):
+        out_dims[0].dim_param = "batch"
+        out_dims[0].ClearField("dim_value")
+
+    try:
+        onnx.save(model, str(cached))
+    except Exception:
+        return weights_path
+
+    return str(cached)
+
+
 class CLIPReIDEmbedder:
     """
     CLIP-based Re-ID embedder using boxmot's ReID backend.
@@ -251,9 +343,13 @@ class OSNetONNXEmbedder:
         self.device = device
         self.half = half and device.startswith("cuda")
         self.tta = tta
+
+        # Attempt to enable dynamic batching via model surgery
+        model_path = _make_batch_dynamic(weights_path)
+
         self._session, active_providers, self.provider_mode = build_session(
             ort,
-            weights_path,
+            model_path,
             device=device,
             half=self.half,
             compute_cfg=compute_cfg,
@@ -272,6 +368,11 @@ class OSNetONNXEmbedder:
         input_meta = self._session.get_inputs()[0]
         self._input_name = input_meta.name
         self._input_type = input_meta.type
+        # Check if batch dimension is fixed (e.g., 1) or dynamic (str/None)
+        in_shape = list(input_meta.shape)
+        self._dynamic_batch = (
+            not in_shape or not isinstance(in_shape[0], int) or in_shape[0] < 1
+        )
         output_meta = self._session.get_outputs()[0]
         self._output_name = output_meta.name
         out_shape = list(output_meta.shape)
@@ -295,9 +396,18 @@ class OSNetONNXEmbedder:
         return np.ascontiguousarray(np.stack(batch, axis=0).astype(self._input_dtype(), copy=False))
 
     def _infer(self, rgb_imgs: list[np.ndarray]) -> torch.Tensor:
-        batch = self._preprocess_batch(rgb_imgs)
-        outputs = self._session.run([self._output_name], {self._input_name: batch})[0]
-        feats = np.asarray(outputs).reshape(len(rgb_imgs), -1)
+        if self._dynamic_batch:
+            batch = self._preprocess_batch(rgb_imgs)
+            outputs = self._session.run([self._output_name], {self._input_name: batch})[0]
+            feats = np.asarray(outputs).reshape(len(rgb_imgs), -1)
+        else:
+            # Model has fixed batch=1 — run each image individually
+            results = []
+            for img in rgb_imgs:
+                single = self._preprocess_batch([img])
+                out = self._session.run([self._output_name], {self._input_name: single})[0]
+                results.append(np.asarray(out).reshape(-1))
+            feats = np.stack(results, axis=0) if results else np.empty((0, self._feat_dim), dtype=np.float32)
         return torch.from_numpy(feats.astype(np.float32, copy=False))
 
     @torch.no_grad()
