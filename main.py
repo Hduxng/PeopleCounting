@@ -94,6 +94,19 @@ def resolve_device(cfg: dict) -> tuple[str, bool]:
     if not device.startswith("cuda"):
         half = False
     print(f"[compute] device={device}  half={half}")
+
+    if device.startswith("cuda"):
+        try:
+            dev_idx = int(device.split(":")[-1]) if ":" in device else 0
+            free_mb = torch.cuda.mem_get_info(dev_idx)[0] / 1024 / 1024
+            total_mb = torch.cuda.get_device_properties(dev_idx).total_mem / 1024 / 1024
+            print(f"[compute] VRAM: {free_mb:.0f}/{total_mb:.0f} MB free")
+            if free_mb < 1500:
+                print(f"[compute] WARNING: low VRAM ({free_mb:.0f} MB free). "
+                      f"RF-DETR needs ~1.5 GB. Performance may degrade severely.")
+        except Exception:
+            pass
+
     return device, half
 
 
