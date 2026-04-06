@@ -1168,7 +1168,7 @@ def run(cfg: dict, save_path: str | None = None, display: bool = False, debug: b
 
                     # Synthetic detections: use gallery feature to avoid zero-norm NaN
                     for det_idx, tid in synthetic_map.items():
-                        gallery_feat = gallery._active.get(tid) if gallery else None
+                        gallery_feat = gallery.get_feature(tid) if gallery else None
                         if gallery_feat is not None:
                             embs_list[det_idx] = gallery_feat.tolist()
                         else:
@@ -1335,7 +1335,7 @@ def run(cfg: dict, save_path: str | None = None, display: bool = False, debug: b
 
                 for det_idx in sorted(synthetic_map):
                     tid = synthetic_map[det_idx]
-                    gallery_feat = gallery._active.get(tid) if gallery is not None else None
+                    gallery_feat = gallery.get_feature(tid) if gallery is not None else None
                     embeds.append(gallery_feat.tolist() if gallery_feat is not None else _fallback_embed())
 
                 while len(embeds) < len(deepsort_dets):
@@ -1591,7 +1591,7 @@ def run(cfg: dict, save_path: str | None = None, display: bool = False, debug: b
                     all_embs.append(_nwojke_fallback().tolist())
                 for det_idx in range(n_real, len(xyxy_boxes)):
                     s_tid = nwojke_synthetic_map.get(det_idx)
-                    gf = gallery._active.get(s_tid) if (gallery and s_tid) else None
+                    gf = gallery.get_feature(s_tid) if (gallery and s_tid) else None
                     all_embs.append(gf.tolist() if gf is not None else _nwojke_fallback().tolist())
             else:
                 real_embs = []

@@ -163,9 +163,11 @@ class TrackGallery:
         active_conflict_center_ratio: float = 0.35,
         max_prototypes: int = 5,
         min_update_conf: float = 0.0,
+        ema_min_similarity: float = 0.5,
         debug_logger=None,
     ):
         self._embedder = embedder
+        self._ema_min_similarity = ema_min_similarity
         self._lifetime = lifetime
         self._alpha = ema_alpha
         self._threshold = match_threshold
@@ -265,6 +267,15 @@ class TrackGallery:
             update_confidences=update_confidences,
         )
         return id_remap
+
+    def get_feature(self, track_id: int) -> np.ndarray | None:
+        """Return the stored representative feature for a track (active or lost)."""
+        feat = self._active.get(track_id)
+        if feat is None:
+            lost_entry = self._lost.get(track_id)
+            if lost_entry is not None:
+                feat = lost_entry[0]
+        return feat
 
     def remove(self, track_id: int) -> None:
         """Permanently remove a track (e.g. after lifetime expires in the main loop)."""
@@ -489,6 +500,10 @@ class TrackGallery:
         if previous is None:
             self._active[tid] = centroid
         else:
+            # Similarity guard: skip blend if new centroid is wildly different
+            sim = float(np.dot(previous, centroid))
+            if sim < self._ema_min_similarity:
+                return
             blended = self._alpha * previous + (1.0 - self._alpha) * centroid
             normalized_blended = _normalize_feature(blended)
             self._active[tid] = normalized_blended if normalized_blended is not None else centroid

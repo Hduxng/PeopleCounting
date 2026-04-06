@@ -102,6 +102,20 @@ class TrackAnchor:
         self._history[tid].append(bbox)
         self._hits[tid] = self._hits.get(tid, 0) + 1
 
+    @staticmethod
+    def is_synthetic_consistent(
+        track_feat: np.ndarray,
+        gallery_feat: np.ndarray | None,
+        threshold: float = 0.3,
+    ) -> bool:
+        """Check if a track associated with a synthetic detection has
+        features consistent with the gallery.  Returns True if consistent
+        or if gallery_feat is unavailable (can't check → accept)."""
+        if gallery_feat is None:
+            return True
+        dist = 1.0 - float(np.dot(track_feat, gallery_feat))
+        return dist <= threshold
+
     def remove(self, tid: int) -> None:
         """Called when a track is permanently lost."""
         self._history.pop(tid, None)
