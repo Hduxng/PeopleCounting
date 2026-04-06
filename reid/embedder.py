@@ -6,12 +6,14 @@ Available embedders:
   - OSNetEmbedder:    OSNet-based Re-ID (CNN backbone, 512-D)  — faster, lighter
   - OSNetONNXEmbedder: ONNX Runtime OSNet backend (512-D)      — no PyTorch inference
 
-Both expose the same interface:
+All implement the ReIDEmbedder protocol:
     embedder(crops: list[np.ndarray]) → list[list[float]]
+    embedder.feat_dim → int
 """
 
 import warnings
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 import cv2
 import numpy as np
@@ -19,6 +21,16 @@ import torch
 import torch.nn.functional as F
 
 from utils.onnx_runtime import build_session
+
+
+@runtime_checkable
+class ReIDEmbedder(Protocol):
+    """Protocol for Re-ID feature extractors."""
+
+    @property
+    def feat_dim(self) -> int: ...
+
+    def __call__(self, crops: list[np.ndarray]) -> list[list[float]]: ...
 
 
 _REID_H, _REID_W = 256, 128   # Standard person Re-ID input resolution

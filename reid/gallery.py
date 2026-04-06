@@ -148,6 +148,7 @@ class TrackGallery:
         min_crop_area: int = 800,
         drift_threshold: float = 0.6,
         merge_area_ratio: float = 1.5,
+        merge_min_width_ratio: float = 1.3,
         merge_release_ratio: float | None = None,
         merge_hold_frames: int = 45,
         drift_confirm_frames: int = 2,
@@ -173,6 +174,7 @@ class TrackGallery:
         self._min_update_conf = float(min_update_conf)
         self._drift_thresh = drift_threshold
         self._merge_area_ratio = merge_area_ratio
+        self._merge_min_width_ratio = merge_min_width_ratio
         release_default = 1.0 + max(merge_area_ratio - 1.0, 0.0) * 0.5
         self._merge_release_ratio = min(
             merge_area_ratio,
@@ -243,6 +245,11 @@ class TrackGallery:
     ) -> dict[int, int]:
         """Call once per frame after the tracker returns confirmed tracks."""
         self._frame_idx = frame_idx
+
+        # Snapshot previous bboxes before overwriting (needed for merge detection)
+        prev_bboxes = {tid: self._last_bbox[tid].copy() for tid in self._last_bbox
+                       if bboxes_by_tid is not None and tid in bboxes_by_tid}
+
         if bboxes_by_tid is not None:
             for tid, bbox in bboxes_by_tid.items():
                 self._last_bbox[tid] = np.asarray(bbox, dtype=float)
@@ -253,7 +260,7 @@ class TrackGallery:
             precomputed_embeddings=precomputed_embeddings,
         )
 
-        self._detect_merges(confirmed_ids, bboxes_by_tid)
+        self._detect_merges(confirmed_ids, bboxes_by_tid, prev_bboxes)
         self._detect_identity_drift(confirmed_ids, embeddings)
         self._age_lost_gallery(confirmed_ids)
         id_remap = self._recover_ids(confirmed_ids, embeddings, bboxes_by_tid)
@@ -272,12 +279,7 @@ class TrackGallery:
         self._active_banks.pop(track_id, None)
         self._lost.pop(track_id, None)
         self._lost_banks.pop(track_id, None)
-        self._last_area.pop(track_id, None)
-        self._last_bbox.pop(track_id, None)
-        self._merged_ids.discard(track_id)
-        self._pre_merge_area.pop(track_id, None)
-        self._merge_counts.pop(track_id, None)
-        self._drift_counts.pop(track_id, None)
+        self._clean_metadata(track_id)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -287,10 +289,13 @@ class TrackGallery:
         self,
         confirmed_ids: set[int],
         bboxes_by_tid: dict[int, np.ndarray] | None,
+        prev_bboxes: dict[int, np.ndarray] | None = None,
     ) -> None:
         """Flag tracks whose bbox area jumped (likely absorbed another person)."""
         if bboxes_by_tid is None:
             return
+        if prev_bboxes is None:
+            prev_bboxes = {}
 
         for tid in confirmed_ids:
             bb = bboxes_by_tid.get(tid)
@@ -306,12 +311,24 @@ class TrackGallery:
             if prev_area is not None and prev_area > 0:
                 ratio = area / prev_area
                 if ratio >= self._merge_area_ratio and tid not in self._merged_ids:
-                    self._merged_ids.add(tid)
-                    self._pre_merge_area[tid] = prev_area
-                    self._merge_counts[tid] = 0
-                    self._drift_counts.pop(tid, None)
-                    if self._dbg is not None:
-                        self._dbg.log_merge(self._frame_idx, tid, area, prev_area)
+                    # Check width ratio to distinguish true merge (width increase)
+                    # from crouch→stand (height increase) or scale change (proportional)
+                    prev_bb = prev_bboxes.get(tid)
+                    width_ok = True
+                    if prev_bb is not None:
+                        prev_w = float(prev_bb[2] - prev_bb[0])
+                        curr_w = float(bb[2] - bb[0])
+                        if prev_w > 0:
+                            width_ratio = curr_w / prev_w
+                            width_ok = width_ratio >= self._merge_min_width_ratio
+
+                    if width_ok:
+                        self._merged_ids.add(tid)
+                        self._pre_merge_area[tid] = prev_area
+                        self._merge_counts[tid] = 0
+                        self._drift_counts.pop(tid, None)
+                        if self._dbg is not None:
+                            self._dbg.log_merge(self._frame_idx, tid, area, prev_area)
                 elif tid in self._merged_ids:
                     pre_area = self._pre_merge_area.get(tid, prev_area)
                     self._merge_counts[tid] = self._merge_counts.get(tid, 0) + 1
@@ -404,9 +421,19 @@ class TrackGallery:
         self._active_banks.pop(tid, None)
         self._drift_counts.pop(tid, None)
 
+    def _clean_metadata(self, tid: int) -> None:
+        """Remove all per-track metadata for a fully removed track."""
+        self._last_area.pop(tid, None)
+        self._last_bbox.pop(tid, None)
+        self._pre_merge_area.pop(tid, None)
+        self._merge_counts.pop(tid, None)
+        self._merged_ids.discard(tid)
+        self._drift_counts.pop(tid, None)
+
     def _restore_lost_to_active(self, new_tid: int, old_tid: int, fallback_feature: np.ndarray | None) -> None:
         representative, _, _ = self._lost.pop(old_tid)
         bank = self._lost_banks.pop(old_tid, None)
+        self._clean_metadata(old_tid)
         cloned_bank = _clone_feature_bank(bank)
         if not cloned_bank:
             fallback = _normalize_feature(fallback_feature if fallback_feature is not None else representative)
@@ -553,6 +580,7 @@ class TrackGallery:
         for tid in expired:
             del self._lost[tid]
             self._lost_banks.pop(tid, None)
+            self._clean_metadata(tid)
 
         for entry in self._lost.values():
             entry[1] += 1

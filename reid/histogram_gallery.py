@@ -18,6 +18,7 @@ Lower = more similar (0 = identical, 1 = completely different).
 
 import cv2
 import numpy as np
+from scipy.optimize import linear_sum_assignment
 
 
 class HistogramGallery:
@@ -87,11 +88,18 @@ class HistogramGallery:
         # {track_id: [histogram, frames_since_lost]}
         self._lost: dict[int, list] = {}
 
+        # {track_id: np.ndarray} — last known bbox (xyxy) for spatial matching
+        self._last_bbox: dict[int, np.ndarray] = {}
+
+        # Max center displacement as fraction of bbox diagonal for recovery
+        self._max_remap_dist_ratio: float = 3.0
+
     # ------------------------------------------------------------------
     def update(
         self,
         confirmed_ids: set[int],
         crops_by_tid: dict[int, np.ndarray],
+        bboxes_by_tid: dict[int, np.ndarray] | None = None,
     ) -> dict[int, int]:
         """
         Call once per frame after the tracker returns confirmed tracks.
@@ -99,15 +107,20 @@ class HistogramGallery:
         Returns:
             id_remap: {new_track_id: recovered_old_track_id}
         """
+        if bboxes_by_tid is not None:
+            for tid, bbox in bboxes_by_tid.items():
+                self._last_bbox[tid] = np.asarray(bbox, dtype=float)
+
         self._detect_identity_drift(confirmed_ids, crops_by_tid)
         self._age_lost_gallery(confirmed_ids)
-        id_remap = self._recover_ids(confirmed_ids, crops_by_tid)
+        id_remap = self._recover_ids(confirmed_ids, crops_by_tid, bboxes_by_tid)
         self._update_active(confirmed_ids, crops_by_tid, id_remap)
         return id_remap
 
     def remove(self, track_id: int) -> None:
         self._active.pop(track_id, None)
         self._lost.pop(track_id, None)
+        self._last_bbox.pop(track_id, None)
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -219,37 +232,90 @@ class HistogramGallery:
         ]
         for tid in expired:
             del self._lost[tid]
+            self._last_bbox.pop(tid, None)
 
         for entry in self._lost.values():
             entry[1] += 1
+
+    def _spatial_match_ok(
+        self,
+        new_bbox: np.ndarray,
+        old_bbox: np.ndarray,
+    ) -> bool:
+        """Check if two bboxes are spatially plausible for the same person."""
+        new_bbox = np.asarray(new_bbox, dtype=float)
+        old_bbox = np.asarray(old_bbox, dtype=float)
+
+        nc = np.array([(new_bbox[0] + new_bbox[2]) * 0.5, (new_bbox[1] + new_bbox[3]) * 0.5])
+        oc = np.array([(old_bbox[0] + old_bbox[2]) * 0.5, (old_bbox[1] + old_bbox[3]) * 0.5])
+        center_dist = float(np.linalg.norm(nc - oc))
+
+        diag = float(np.linalg.norm([
+            old_bbox[2] - old_bbox[0],
+            old_bbox[3] - old_bbox[1],
+        ]))
+        if diag <= 0:
+            return True
+        return center_dist <= self._max_remap_dist_ratio * diag
 
     def _recover_ids(
         self,
         confirmed_ids: set[int],
         crops_by_tid: dict[int, np.ndarray],
+        bboxes_by_tid: dict[int, np.ndarray] | None = None,
     ) -> dict[int, int]:
         if not self._lost:
             return {}
 
-        new_ids = confirmed_ids - set(self._active)
-        id_remap = {}
+        new_ids = sorted(confirmed_ids - set(self._active))
+        if not new_ids:
+            return {}
 
+        lost_ids = sorted(self._lost)
+
+        # Compute histograms for new tracks
+        new_hists: dict[int, np.ndarray] = {}
         for new_tid in new_ids:
-            crop = crops_by_tid.get(new_tid)
-            new_hist = self._compute_histogram(crop)
-            if new_hist is None:
-                continue
+            hist = self._compute_histogram(crops_by_tid.get(new_tid))
+            if hist is not None:
+                new_hists[new_tid] = hist
 
-            best_old, best_dist = None, self._threshold
-            for old_tid, (old_hist, _) in self._lost.items():
+        valid_new = sorted(new_hists)
+        if not valid_new:
+            return {}
+
+        # Build cost matrix: rows = new tracks, cols = lost tracks + dummy columns
+        num_new = len(valid_new)
+        num_old = len(lost_ids)
+        invalid_cost = 1e9
+        cost_matrix = np.full((num_new, num_old + num_new), invalid_cost, dtype=np.float64)
+        cost_matrix[:, num_old:] = self._threshold  # dummy columns = "no match"
+
+        for row, new_tid in enumerate(valid_new):
+            new_hist = new_hists[new_tid]
+            new_bbox = None if bboxes_by_tid is None else bboxes_by_tid.get(new_tid)
+            for col, old_tid in enumerate(lost_ids):
+                old_hist, _ = self._lost[old_tid]
                 dist = self._compare(new_hist, old_hist)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_old = old_tid
+                if dist >= self._threshold:
+                    continue
+                # Spatial sanity check
+                old_bbox = self._last_bbox.get(old_tid) if hasattr(self, '_last_bbox') else None
+                if new_bbox is not None and old_bbox is not None:
+                    if not self._spatial_match_ok(new_bbox, old_bbox):
+                        continue
+                cost_matrix[row, col] = dist
 
-            if best_old is not None:
-                id_remap[new_tid] = best_old
-                self._active[new_tid] = self._lost.pop(best_old)[0]
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+        id_remap: dict[int, int] = {}
+
+        for row, col in zip(row_ind, col_ind):
+            if col >= num_old or cost_matrix[row, col] >= self._threshold:
+                continue
+            new_tid = valid_new[row]
+            old_tid = lost_ids[col]
+            id_remap[new_tid] = old_tid
+            self._active[new_tid] = self._lost.pop(old_tid)[0]
 
         return id_remap
 
