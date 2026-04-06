@@ -269,7 +269,7 @@ class TestLevel2_CrosslineWithTracker:
             f"Expected at least IN=1, got {res['crossline_counts']}"
 
     def test_two_people_opposite_directions(self):
-        """Person A enters (top→bottom), Person B exits (bottom→top)."""
+        """Person A enters; Person B exits without prior IN, so OUT should stay 0."""
         tracker = _build_test_tracker()
         reid = _build_reid_embedder()
         sim = SceneSimulator(1280, 720)
@@ -289,7 +289,7 @@ class TestLevel2_CrosslineWithTracker:
 
         counts = res["crossline_counts"]
         assert counts["in"] >= 1, f"Expected IN>=1, got {counts}"
-        assert counts["out"] >= 1, f"Expected OUT>=1, got {counts}"
+        assert counts["out"] == 0, f"Expected OUT=0 without prior IN, got {counts}"
 
 
 # =========================================================================

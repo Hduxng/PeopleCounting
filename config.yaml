@@ -1,5 +1,5 @@
 video:
-  source: test3.mp4           # 0 = webcam, or path to video file e.g. "test2.mp4"
+  source: test2.mp4           # 0 = webcam, or path to video file e.g. "test2.mp4"
   fps_override: null  # null = use video fps; set a number to override
 
 runtime:
@@ -150,12 +150,12 @@ tracker:
     downsample: 2
 
 counting:
-  mode: "zone"   # line | zone | both
+  mode: "line"   # line | zone | both
 
   crosslines:
     - id: "line_entrance"
       name: "Entrance"
-      points: [[626, 118], [41, 110]]
+      points: [[14, 132], [636, 128]]
       enter_direction: "positive"
       buffer_px: 20
       confirm_frames: 2

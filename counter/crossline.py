@@ -67,6 +67,7 @@ class CrosslineCounter(BaseCounter):
         # "positive" → crossing from negative→positive side counts as enter
         # "negative" → crossing from positive→negative side counts as enter
         self.enter_direction: str = config.get("enter_direction", "positive")
+        self._require_prior_in_for_out: bool = bool(config.get("require_prior_in_for_out", True))
         self._confirm_frames: int = int(config.get("confirm_frames", 1))
         self._handoff_sec: float = float(config.get("handoff_seconds", 1.0))
         self._handoff_radius: float = float(config.get("handoff_radius_px", max(self.buffer_px * 2.0, 60.0)))
@@ -235,6 +236,8 @@ class CrosslineCounter(BaseCounter):
                 self._counted_in_ids.add(track_id)
                 result["entered"] = True
         else:
+            if self._require_prior_in_for_out and track_id not in self._counted_in_ids:
+                return result
             if track_id not in self._counted_out_ids:
                 self.count_out += 1
                 self._counted_out_ids.add(track_id)

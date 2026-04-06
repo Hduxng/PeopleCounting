@@ -33,7 +33,7 @@ class TestLevel1_BasicCrossline:
         assert counts["out"] == 0
 
     def test_1_5_single_person_crosses_line_exit(self, crossline_cfg):
-        """One person walks bottom→top → OUT=1."""
+        """One person walks bottom→top without prior IN → OUT stays 0."""
         counter = CrosslineCounter(crossline_cfg)
         tid = 1
 
@@ -43,7 +43,37 @@ class TestLevel1_BasicCrossline:
 
         counts = counter.get_counts()
         assert counts["in"] == 0
-        assert counts["out"] == 1, f"Expected OUT=1, got {counts}"
+        assert counts["out"] == 0, f"Expected OUT=0 without prior IN, got {counts}"
+
+    def test_exit_requires_prior_in_when_enabled(self, crossline_cfg):
+        """When enabled, OUT only increments for IDs that were already counted IN."""
+        cfg = dict(crossline_cfg)
+        cfg["require_prior_in_for_out"] = True
+        counter = CrosslineCounter(cfg)
+        tid = 1
+
+        for y in range(600, 100, -10):
+            counter.update(tid, (640, y), timestamp=(600 - y) / 30.0)
+
+        counts = counter.get_counts()
+        assert counts["in"] == 0
+        assert counts["out"] == 0, f"OUT should require prior IN, got {counts}"
+
+    def test_exit_still_counts_after_prior_in_when_enabled(self, crossline_cfg):
+        """With the rule enabled, the same ID can count OUT after it was counted IN."""
+        cfg = dict(crossline_cfg)
+        cfg["require_prior_in_for_out"] = True
+        counter = CrosslineCounter(cfg)
+        tid = 1
+
+        for y in range(100, 500, 10):
+            counter.update(tid, (640, y), timestamp=y / 30.0)
+        for y in range(500, 100, -10):
+            counter.update(tid, (640, y), timestamp=(500 + (500 - y)) / 30.0)
+
+        counts = counter.get_counts()
+        assert counts["in"] == 1
+        assert counts["out"] == 1, f"Expected OUT after prior IN, got {counts}"
 
     def test_1_1_single_person_stable_id(self, crossline_cfg):
         """One person passes through — same ID throughout, counted once."""
@@ -154,7 +184,7 @@ class TestLevel2_CrosslineEdgeCases:
         assert counts["out"] == 0
 
     def test_multiple_people_different_directions(self, crossline_cfg):
-        """Person A enters, Person B exits → IN=1, OUT=1."""
+        """Person A enters, Person B exits without prior IN → only IN counts."""
         counter = CrosslineCounter(crossline_cfg)
 
         # Person A: top → bottom (enter)
@@ -167,7 +197,7 @@ class TestLevel2_CrosslineEdgeCases:
 
         counts = counter.get_counts()
         assert counts["in"] == 1
-        assert counts["out"] == 1
+        assert counts["out"] == 0
 
 
 class TestLevel2_ZoneEdgeCases:
