@@ -1,4 +1,12 @@
-from reid.embedder import OSNetEmbedder
+from reid.embedder import CLIPReIDEmbedder, OSNetEmbedder, OSNetONNXEmbedder, ReIDEmbedder
 from reid.gallery import TrackGallery
+from reid.histogram_gallery import HistogramGallery
 
-__all__ = ["OSNetEmbedder", "TrackGallery"]
+__all__ = [
+    "ReIDEmbedder",
+    "CLIPReIDEmbedder",
+    "OSNetEmbedder",
+    "OSNetONNXEmbedder",
+    "TrackGallery",
+    "HistogramGallery",
+]

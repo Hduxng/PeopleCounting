@@ -1,57 +1,158 @@
 video:
-  source: 0           # 0 = webcam, or path to video file e.g. "test.mp4"
+  source: test2.mp4           # 0 = webcam, or path to video file e.g. "test2.mp4"
   fps_override: null  # null = use video fps; set a number to override
 
-# Global compute settings — applied to detector, tracker, and Re-ID
+runtime:
+  display: false      # true = show preview window when running `python main.py`
+  debug: true        # true = write debug logs to debug/
+
+output:
+  save: true          # false = do not save output video
+  path: null          # null = auto-generate output/<source>_<timestamp>.mp4
+
+# Global compute settings — applied to detector and tracker
 compute:
-  device: "cuda:0" # auto | cuda | cpu | cuda:0 | cuda:1
+  device: "auto" # auto | cuda | cpu | cuda:0 | cuda:1
   half: true       # FP16 inference — faster on GPU, not supported on CPU
+  onnx_runtime:
+    provider: "tensorrt"    # auto | tensorrt | cuda | cpu
+    trt_fp16: true           # use FP16 TensorRT kernels when available
+    trt_engine_cache: true   # cache TensorRT engines across runs
+    trt_engine_cache_path: "output/trt_cache"
+    trt_timing_cache: true   # reuse TensorRT tactic timing across runs
 
 detector:
-  model: "yolov8n.pt"       # yolov8n/s/m/l/x.pt — larger = more accurate, slower
-  confidence: 0.35          # two-stage: low threshold lets tracker associate partial detections
-  confidence_new_track: 0.5 # only CREATE a new track if confidence >= this value
-  iou: 0.4
+  model: "checkpoint_best_ema.onnx"  # supports YOLO .pt/.onnx and RF-DETR .pth/.onnx
+  confidence: 0.25          # lower threshold: catch partially occluded people
+  confidence_new_track: 0.45 # only CREATE a new track if confidence >= this value
+  iou: 0.65                 # YOLO NMS IoU; RF-DETR ONNX uses detector.dedup below instead
   classes: [0]              # COCO class 0 = person
+  dedup:
+    enabled: true           # RF-DETR ONNX: suppress near-identical person boxes before tracking
+    iou: 0.68               # high IoU duplicate threshold
+    containment: 0.82       # suppress box-inside-box duplicates when centers align
+    area_ratio: 0.55        # require roughly similar size for IoU-based duplicate suppression
+    center_ratio: 0.24      # max center distance as a fraction of the smaller-box diagonal
+
+# ====================================================================
+# TRACKER + RE-ID CONFIGURATION
+# ====================================================================
+# Supported combinations (change tracker.type + tracker.reid to swap):
+#
+#   tracker.type   | tracker.reid.type | Description                    | Speed | Accuracy
+#   ---------------|-------------------|--------------------------------|-------|----------
+#   botsort        | clip              | BoT-SORT + CLIP-ReID (507MB)   | Slow  | Best
+#   botsort        | osnet             | BoT-SORT + OSNet (0.8-8.7MB)   | Med   | Good
+#   deepsort       | clip              | DeepSORT + CLIP-ReID            | Med   | Good+
+#   deepsort       | osnet             | DeepSORT + OSNet                | Fast  | Good
+#   strongsort     | clip              | StrongSORT + CLIP-ReID          | Slow  | Best
+#   strongsort     | osnet             | StrongSORT + OSNet              | Med   | Good
+#   bytetrack      | (none)            | ByteTrack + Histogram gallery   | Fast  | Fair
+#
+# OSNet model variants (set tracker.reid.model):
+#   osnet_x0_25       — 0.2M params,  0.8MB  (fastest, lowest accuracy)
+#   osnet_x0_5        — 0.63M params, 2.5MB
+#   osnet_x0_75       — 1.29M params, 5.1MB
+#   osnet_x1_0        — 2.17M params, 8.7MB  (default)
+#   osnet_ain_x1_0    — 2.17M params, 8.7MB  (attention-based, slightly better)
+#
+# Recommended presets:
+#   [Max accuracy]  type=botsort,  reid.type=clip
+#   [Balanced]      type=deepsort, reid.type=osnet, reid.model=osnet_x1_0
+#   [Fast+light]    type=deepsort, reid.type=osnet, reid.model=osnet_x0_25
+#   [Fastest]       type=bytetrack (no model Re-ID)
+# ====================================================================
 
 tracker:
-  # Tracker options (best → fastest):
-  #   strongsort  — EMA features + NSA Kalman + MSMT17 Re-ID  [recommended]
-  #   deepsort    — custom OSNet Re-ID + TTA embeddings
-  #   bytetrack   — ultralytics built-in, fastest, no appearance
-  #   botsort     — ultralytics built-in, fast + Re-ID
-  type: "strongsort"
+  type: "nwojke"         # nwojke | botsort | strongsort | deepsort | bytetrack
+  max_display_age: 1     # frames: 0=only matched-this-frame, 1=tolerate 1 miss (eliminates ghost drift)
 
-  # Shared params
-  n_init: 3             # frames to confirm a new track
+  # --- Re-ID model ---
+  reid:
+    type: "osnet"                       # clip | osnet
+    # CLIP-ReID settings (used when type=clip)
+    weights: "clip_market1501.pt"
+    # OSNet settings (used when type=osnet)
+    model: "osnet_ain_x1_0"            # osnet_x0_25 | osnet_x0_5 | osnet_x0_75 | osnet_x1_0 | osnet_ain_x1_0
+    osnet_weights: null                # null = use PyTorch torchreid backend; set an .onnx file to use ONNX Runtime
+    tta: false                          # test-time augmentation (h-flip) — slower but +1-2% accuracy
+
+  # --- BoT-SORT specific params ---
+  track_high_thresh: 0.45
+  track_low_thresh: 0.1
+  new_track_thresh: 0.5
+  track_buffer: 120
+  match_thresh: 0.8
+  proximity_thresh: 0.5
+  appearance_thresh: 0.20
+  cmc_method: "ecc"
+  fuse_first_associate: true
+  frame_rate: 30
+
+  # --- DeepSORT / StrongSORT specific params ---
+  n_init: 3
   max_iou_distance: 0.7
   max_cosine_distance: 0.3
   nn_budget: 100
+  max_age: 30            # nwojke: frames before track is deleted internally (display cutoff = max_display_age)
+  ema_alpha: 0.9
+  min_conf: 0.25
 
-  # StrongSORT-specific
-  max_age: 60           # frames to keep lost track alive (~2s at 30fps)
-  ema_alpha: 0.9        # EMA weight for appearance features
-  min_conf: 0.35        # keep in sync with detector.confidence
+  # --- Histogram gallery (auto-used with bytetrack) ---
+  histogram_gallery:
+    enabled: true
+    lifetime: 150
+    ema_alpha: 0.85
+    match_threshold: 0.55
+    drift_threshold: 0.70
+    use_clahe: true
+    spatial_pyramid: true
+    n_strips: 3
+    v_bins: 32
+    v_weight: 0.3
 
-  # Re-ID model — osnet_ain handles lighting/camera changes better than plain osnet
-  reid:
-    weights: "osnet_ain_x1_0_msmt17.pt"  # AIN: Adaptive Instance Norm, better cross-domain
-    tta: false
-
-  # Feature gallery for Re-ID recovery (prevents double-counting after occlusion)
+  # --- Model-based gallery (auto-used with botsort/strongsort/deepsort) ---
   gallery:
     enabled: true
-    lifetime: 90          # frames to keep a lost track in gallery (~3s at 30fps)
-    ema_alpha: 0.85       # feature EMA for gallery updates
-    match_threshold: 0.28 # cosine distance threshold for re-ID match (lower = stricter)
+    lifetime: 300
+    ema_alpha: 0.85
+    match_threshold: 0.35
+    max_prototypes: 5
+    min_update_conf: 0.55
+    min_crop_area: 800
+    drift_threshold: 0.6
+    merge_area_ratio: 1.5   # bbox area jump ≥ 1.5x → freeze feature (merge detected)
+    merge_release_ratio: 1.35  # unfreeze once area settles back below this multiple of pre-merge size
+    merge_hold_frames: 45      # fail-safe: never keep merge freeze longer than this many frames
 
-  # TrackAnchor — guarantees track survival for people still visible in frame
+  # --- TrackAnchor — velocity-EMA prediction with adaptive drift ---
   anchor:
     enabled: true
-    min_iou: 0.15         # IoU threshold to consider a track "covered" by a detection
-    synthetic_conf: 0.45  # confidence of injected detections (must be > min_conf, < confidence_new_track)
-    min_hits: 3           # minimum confirmed frames before a track is eligible for anchoring
-    max_inject: 10        # max synthetic detections per frame
+    min_iou: 0.15
+    synthetic_conf: 0.40
+    min_hits: 3
+    max_inject: 10
+    velocity_window: 5
+    velocity_ema_alpha: 0.4
+    stationary_threshold: 0.5
+    max_lost_frames: 8      # stop injecting after N consecutive frames with no real detection
+    edge_margin_px: 5.0     # bbox within this margin of frame edge → exit, don't inject
+
+  # --- Post-tracker validation ---
+  post_validation:
+    enabled: true
+    max_ar_change: 0.3
+    max_area_change: 0.5
+    min_track_age: 5
+    confidence_penalty: 0.5
+
+  # --- Camera Motion Compensation (off by default) ---
+  cmc:
+    enabled: false
+    pyr_scale: 0.5
+    levels: 3
+    winsize: 15
+    downsample: 2
 
 counting:
   mode: "zone"   # line | zone | both
@@ -59,36 +160,34 @@ counting:
   crosslines:
     - id: "line_entrance"
       name: "Entrance"
-      # Two endpoints of the line: [[x1, y1], [x2, y2]]
-      points: [[89, 355], [1205, 355]]
-      # Which side is "enter":
-      #   "positive" = crossing from negative to positive side of the line (cross-product convention)
-      #   "negative" = the opposite
+      points: [[14, 132], [636, 128]]
       enter_direction: "positive"
-      # Hysteresis buffer in pixels around the line.
-      # Person must move this far from the line before a crossing is confirmed.
-      # Prevents counting oscillations (slide 4 rule).
       buffer_px: 20
+      confirm_frames: 2
 
   zones:
     - id: "zone_waiting"
       name: "Waiting Area"
-      # Polygon vertices [[x1,y1], [x2,y2], ...] — at least 3 points
-      points: [[141, 135], [614, 120], [596, 295], [141, 296]]
-      # Minimum seconds a person must stay inside to be counted (slide 5 rule)
+      points: [[96, 101], [628, 103], [619, 258], [89, 256]]
       min_dwell_seconds: 10.0
+      refractory_seconds: 0.17
+      exit_grace_seconds: 0.4
 
 display:
   window_name: "People Counting"
-  window_size: [1600, 900]  # initial OpenCV preview size; still resizable
+  window_size: [1600, 900]
   show_bbox: true
   show_centers: true
   show_ids: true
-  # Colors in BGR (OpenCV format)
-  bbox_color: [0, 255, 255]     # cyan
-  line_color: [0, 255, 0]       # green
-  zone_color: [0, 165, 255]     # orange
+  bbox_color: [255, 255, 0]         # cyan box (BGR)
+  center_color: [255, 0, 255]       # magenta center
+  id_text_color: [255, 255, 255]    # white ID text
+  id_bg_color: [24, 24, 24]         # dark ID label background
+  line_color: [80, 255, 80]         # vivid green line
+  line_label_bg_color: [40, 96, 40] # dark green count label background
+  zone_color: [0, 140, 255]         # orange zone
+  zone_label_bg_color: [0, 96, 176] # darker orange label background
   count_text_color: [255, 255, 255]
   font_scale: 0.6
   thickness: 2
-  bbox_ema_alpha: 0.6   # bbox smoothing: 1.0=no smoothing, 0.4=heavy smoothing
+  bbox_ema_alpha: 0.6
